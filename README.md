@@ -4,7 +4,7 @@
 [![Language](https://img.shields.io/badge/Language-C11-orange.svg)]()
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg)]()
 
-> 基于 SM2/SM3/SM4 算法的 ECQV 隐式证书 PKI 协议栈，适用于受限网络环境。
+> 基于 SM2/SM3/SM4 算法的 ECQV 隐式证书 PKI 协议栈，专为受限航空网络与无人机机载环境设计。
 
 [English](#english-summary) | [中文说明](#项目简介)
 
