@@ -55,6 +55,7 @@ extern int g_ca_initialized;
 
 double now_ms_highres(void);
 double calc_p95_ms(double *samples, size_t count);
+double calc_median_value(double *samples, size_t count);
 
 void test_setup_ca(void);
 

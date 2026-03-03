@@ -53,3 +53,13 @@ double calc_p95_ms(double *samples, size_t count)
         idx = count;
     return samples[idx - 1];
 }
+
+double calc_median_value(double *samples, size_t count)
+{
+    if (!samples || count == 0)
+        return 0.0;
+    qsort(samples, count, sizeof(double), cmp_double_asc);
+    if ((count & 1U) != 0U)
+        return samples[count / 2];
+    return (samples[(count / 2) - 1] + samples[count / 2]) / 2.0;
+}

@@ -433,6 +433,35 @@ static void test_revocation_false_positive_rate_constrained()
     TEST_PASS();
 }
 
+static void test_revocation_cleanup_idempotent_and_param_defense()
+{
+    sm2_revocation_ctx_t ctx;
+    TEST_ASSERT(sm2_revocation_init(&ctx, 32, 300, 100) == SM2_IC_SUCCESS,
+        "Revocation Init");
+
+    sm2_revocation_cleanup(&ctx);
+    sm2_revocation_cleanup(&ctx);
+
+    sm2_rev_status_t status;
+    sm2_rev_source_t source;
+    TEST_ASSERT(sm2_revocation_query(NULL, 1, 100, &status, &source)
+            == SM2_IC_ERR_PARAM,
+        "Query NULL Ctx");
+    TEST_ASSERT(
+        sm2_revocation_query(&ctx, 1, 100, NULL, &source) == SM2_IC_ERR_PARAM,
+        "Query NULL Status");
+    TEST_ASSERT(
+        sm2_revocation_query(&ctx, 1, 100, &status, NULL) == SM2_IC_ERR_PARAM,
+        "Query NULL Source");
+    TEST_ASSERT(sm2_revocation_config_ocsp(&ctx, NULL) == SM2_IC_ERR_PARAM,
+        "Config OCSP NULL");
+    TEST_ASSERT(
+        sm2_revocation_config_local_filter(&ctx, 0, 4, 1) == SM2_IC_ERR_PARAM,
+        "Config Filter Invalid");
+
+    TEST_PASS();
+}
+
 void run_test_revoke_suite(void)
 {
     RUN_TEST(test_revocation_delta_and_cuckoo);
@@ -443,4 +472,5 @@ void run_test_revoke_suite(void)
     RUN_TEST(test_revocation_ocsp_latency_sla);
     RUN_TEST(test_revocation_false_positive_rate);
     RUN_TEST(test_revocation_false_positive_rate_constrained);
+    RUN_TEST(test_revocation_cleanup_idempotent_and_param_defense);
 }

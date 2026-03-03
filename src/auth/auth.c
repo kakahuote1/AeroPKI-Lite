@@ -294,10 +294,16 @@ sm2_ic_error_t sm2_auth_precompute_pool_fill(
     if (pool->available >= target_available)
         return SM2_IC_SUCCESS;
 
-    /* EVP does not expose ECDSA (kinv,r) precomputation. We keep a lightweight
-       token pool to represent message-independent prepared signing capacity. */
-    for (size_t i = 0; i < pool->capacity && pool->available < target_available;
-        i++)
+    size_t cap = pool->capacity;
+    size_t target = target_available;
+
+    /* EVP does not expose ECDSA (kinv,r) precomputation.
+     * We keep a
+     * lightweight token pool to represent
+     * message-independent prepared
+     * signing capacity.
+     */
+    for (size_t i = 0; i < cap && pool->available < target; i++)
     {
         if (pool->slots[i].used)
             continue;

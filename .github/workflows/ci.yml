@@ -7,6 +7,8 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-latest
+    env:
+      CLANG_FORMAT: clang-format-18
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -14,12 +16,16 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libssl-dev clang-format
+          sudo apt-get install -y cmake ninja-build libssl-dev clang-format-18
+
+      - name: Show clang-format Version
+        run: |
+          ${CLANG_FORMAT} --version
 
       - name: Format Check
         run: |
-          FILES=$(find include src tests -type f \( -name "*.h" -o -name "*.c" \))
-          clang-format --dry-run -Werror $FILES
+          find include src tests -type f \( -name "*.h" -o -name "*.c" \) -print0 \
+            | xargs -0 ${CLANG_FORMAT} --dry-run -Werror -style=file
 
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -53,4 +59,3 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build
           ctest --test-dir build --output-on-failure
-

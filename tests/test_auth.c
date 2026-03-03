@@ -155,6 +155,42 @@ static void test_auth_batch_verify()
     TEST_PASS();
 }
 
+static void test_auth_cleanup_idempotent_and_param_defense()
+{
+    if (!g_ca_initialized)
+        test_setup_ca();
+
+    sm2_auth_precompute_pool_t pool;
+    TEST_ASSERT(
+        sm2_auth_precompute_pool_init(&pool, &g_ca_priv, 8) == SM2_IC_SUCCESS,
+        "Pool Init");
+    TEST_ASSERT(
+        sm2_auth_precompute_pool_fill(&pool, 4) == SM2_IC_SUCCESS, "Pool Fill");
+
+    sm2_auth_precompute_pool_cleanup(&pool);
+    TEST_ASSERT(pool.slots == NULL, "Cleanup Reset Slots");
+    TEST_ASSERT(pool.native_sign_key == NULL, "Cleanup Reset Native");
+    TEST_ASSERT(pool.available == 0, "Cleanup Reset Available");
+
+    sm2_auth_precompute_pool_cleanup(&pool);
+    TEST_ASSERT(pool.slots == NULL, "Cleanup Idempotent Slots");
+    TEST_ASSERT(pool.native_sign_key == NULL, "Cleanup Idempotent Native");
+
+    TEST_ASSERT(
+        sm2_auth_precompute_pool_init(NULL, &g_ca_priv, 8) == SM2_IC_ERR_PARAM,
+        "Pool Init NULL");
+    TEST_ASSERT(sm2_auth_precompute_pool_fill(NULL, 1) == SM2_IC_ERR_PARAM,
+        "Pool Fill NULL");
+    TEST_ASSERT(
+        sm2_auth_sign(NULL, (const uint8_t *)"A", 1, NULL) == SM2_IC_ERR_PARAM,
+        "Sign NULL");
+    TEST_ASSERT(sm2_auth_verify_signature(NULL, (const uint8_t *)"A", 1, NULL)
+            == SM2_IC_ERR_PARAM,
+        "Verify NULL");
+
+    TEST_PASS();
+}
+
 static void test_auth_cross_domain_unified()
 {
     sm2_private_key_t ca1_priv, ca2_priv;
@@ -422,91 +458,108 @@ static void test_auth_phase3_perf_targets()
 
     enum
     {
+        perf_rounds = 5,
         sample_count = 64,
         burst_ops = 8,
         total_ops = sample_count * burst_ops
     };
     sm2_auth_signature_t sig;
     uint8_t msg[32];
+    double tp_gain_samples[perf_rounds];
+    double p95_pool_samples[perf_rounds];
+    double p95_plain_samples[perf_rounds];
+    double p95_reduction_samples[perf_rounds];
 
-    sm2_auth_precompute_pool_t pool;
-    TEST_ASSERT(sm2_auth_precompute_pool_init(&pool, &user_priv, total_ops)
-            == SM2_IC_SUCCESS,
-        "Pool Init");
-    TEST_ASSERT(
-        sm2_auth_precompute_pool_fill(&pool, total_ops) == SM2_IC_SUCCESS,
-        "Pool Fill");
-
-    double tp_pool_start = now_ms_highres();
-    for (int i = 0; i < total_ops; i++)
+    for (int r = 0; r < perf_rounds; r++)
     {
-        memset(msg, (uint8_t)(i & 0xFF), sizeof(msg));
-        TEST_ASSERT(sm2_auth_sign_with_pool(&pool, msg, sizeof(msg), &sig)
+        sm2_auth_precompute_pool_t pool;
+        TEST_ASSERT(sm2_auth_precompute_pool_init(&pool, &user_priv, total_ops)
                 == SM2_IC_SUCCESS,
-            "TP Pool Sign");
-    }
-    double tp_pool_ms = now_ms_highres() - tp_pool_start;
-    sm2_auth_precompute_pool_cleanup(&pool);
-
-    double tp_plain_start = now_ms_highres();
-    for (int i = 0; i < total_ops; i++)
-    {
-        memset(msg, (uint8_t)(i & 0xFF), sizeof(msg));
+            "Pool Init");
         TEST_ASSERT(
-            sm2_auth_sign(&user_priv, msg, sizeof(msg), &sig) == SM2_IC_SUCCESS,
-            "TP Plain Sign");
-    }
-    TEST_ASSERT(sm2_auth_verify_signature(&user_pub, msg, sizeof(msg), &sig)
-            == SM2_IC_SUCCESS,
-        "TP Verify");
-    double tp_plain_ms = now_ms_highres() - tp_plain_start;
-    TEST_ASSERT(tp_pool_ms > 0.0, "Pool Time Zero");
-    double throughput_gain = tp_plain_ms / tp_pool_ms;
+            sm2_auth_precompute_pool_fill(&pool, total_ops) == SM2_IC_SUCCESS,
+            "Pool Fill");
 
-    TEST_ASSERT(sm2_auth_precompute_pool_init(&pool, &user_priv, total_ops)
-            == SM2_IC_SUCCESS,
-        "Pool2 Init");
-    TEST_ASSERT(
-        sm2_auth_precompute_pool_fill(&pool, total_ops) == SM2_IC_SUCCESS,
-        "Pool2 Fill");
-
-    double pool_lat[sample_count];
-    double plain_lat[sample_count];
-    for (int s = 0; s < sample_count; s++)
-    {
-        double t0 = now_ms_highres();
-        for (int j = 0; j < burst_ops; j++)
+        double tp_pool_start = now_ms_highres();
+        for (int i = 0; i < total_ops; i++)
         {
-            memset(msg, (uint8_t)((s * burst_ops + j) & 0xFF), sizeof(msg));
+            memset(msg, (uint8_t)(i & 0xFF), sizeof(msg));
             TEST_ASSERT(sm2_auth_sign_with_pool(&pool, msg, sizeof(msg), &sig)
                     == SM2_IC_SUCCESS,
-                "P95 Pool Sign");
+                "TP Pool Sign");
         }
-        pool_lat[s] = (now_ms_highres() - t0) / burst_ops;
-    }
-    sm2_auth_precompute_pool_cleanup(&pool);
+        double tp_pool_ms = now_ms_highres() - tp_pool_start;
+        sm2_auth_precompute_pool_cleanup(&pool);
 
-    for (int s = 0; s < sample_count; s++)
-    {
-        double t0 = now_ms_highres();
-        for (int j = 0; j < burst_ops; j++)
+        double tp_plain_start = now_ms_highres();
+        for (int i = 0; i < total_ops; i++)
         {
-            memset(msg, (uint8_t)((s * burst_ops + j) & 0xFF), sizeof(msg));
+            memset(msg, (uint8_t)(i & 0xFF), sizeof(msg));
             TEST_ASSERT(sm2_auth_sign(&user_priv, msg, sizeof(msg), &sig)
                     == SM2_IC_SUCCESS,
-                "P95 Plain Sign");
+                "TP Plain Sign");
         }
-        plain_lat[s] = (now_ms_highres() - t0) / burst_ops;
+        TEST_ASSERT(sm2_auth_verify_signature(&user_pub, msg, sizeof(msg), &sig)
+                == SM2_IC_SUCCESS,
+            "TP Verify");
+        double tp_plain_ms = now_ms_highres() - tp_plain_start;
+        TEST_ASSERT(tp_pool_ms > 0.0, "Pool Time Zero");
+        tp_gain_samples[r] = tp_plain_ms / tp_pool_ms;
+
+        TEST_ASSERT(sm2_auth_precompute_pool_init(&pool, &user_priv, total_ops)
+                == SM2_IC_SUCCESS,
+            "Pool2 Init");
+        TEST_ASSERT(
+            sm2_auth_precompute_pool_fill(&pool, total_ops) == SM2_IC_SUCCESS,
+            "Pool2 Fill");
+
+        double pool_lat[sample_count];
+        double plain_lat[sample_count];
+        for (int s = 0; s < sample_count; s++)
+        {
+            double t0 = now_ms_highres();
+            for (int j = 0; j < burst_ops; j++)
+            {
+                memset(msg, (uint8_t)((s * burst_ops + j) & 0xFF), sizeof(msg));
+                TEST_ASSERT(
+                    sm2_auth_sign_with_pool(&pool, msg, sizeof(msg), &sig)
+                        == SM2_IC_SUCCESS,
+                    "P95 Pool Sign");
+            }
+            pool_lat[s] = (now_ms_highres() - t0) / burst_ops;
+        }
+        sm2_auth_precompute_pool_cleanup(&pool);
+
+        for (int s = 0; s < sample_count; s++)
+        {
+            double t0 = now_ms_highres();
+            for (int j = 0; j < burst_ops; j++)
+            {
+                memset(msg, (uint8_t)((s * burst_ops + j) & 0xFF), sizeof(msg));
+                TEST_ASSERT(sm2_auth_sign(&user_priv, msg, sizeof(msg), &sig)
+                        == SM2_IC_SUCCESS,
+                    "P95 Plain Sign");
+            }
+            plain_lat[s] = (now_ms_highres() - t0) / burst_ops;
+        }
+
+        p95_pool_samples[r] = calc_p95_ms(pool_lat, sample_count);
+        p95_plain_samples[r] = calc_p95_ms(plain_lat, sample_count);
+        TEST_ASSERT(p95_plain_samples[r] > 0.0, "P95 Plain Zero");
+        p95_reduction_samples[r] = (p95_plain_samples[r] - p95_pool_samples[r])
+            / p95_plain_samples[r];
     }
 
-    double p95_pool = calc_p95_ms(pool_lat, sample_count);
-    double p95_plain = calc_p95_ms(plain_lat, sample_count);
-    TEST_ASSERT(p95_plain > 0.0, "P95 Plain Zero");
-    double p95_reduction = (p95_plain - p95_pool) / p95_plain;
+    double throughput_gain = calc_median_value(tp_gain_samples, perf_rounds);
+    double p95_pool = calc_median_value(p95_pool_samples, perf_rounds);
+    double p95_plain = calc_median_value(p95_plain_samples, perf_rounds);
+    double p95_reduction
+        = calc_median_value(p95_reduction_samples, perf_rounds);
 
-    printf("   [P3-PERF] tp_gain=%.4fx, p95_pool=%.4f ms, p95_plain=%.4f ms, "
-           "p95_reduction=%.4f%%\n",
-        throughput_gain, p95_pool, p95_plain, p95_reduction * 100.0);
+    printf("   [P3-PERF-MEDIAN] rounds=%d, tp_gain=%.4fx, p95_pool=%.4f ms, "
+           "p95_plain=%.4f ms, p95_reduction=%.4f%%\n",
+        perf_rounds, throughput_gain, p95_pool, p95_plain,
+        p95_reduction * 100.0);
 
     TEST_ASSERT(throughput_gain >= 2.0, "Phase3 Throughput Gain < 2x");
     TEST_ASSERT(p95_reduction >= 0.30, "Phase3 P95 Reduction < 30%");
@@ -573,6 +626,7 @@ void run_test_auth_suite(void)
 {
     RUN_TEST(test_auth_precompute_pool);
     RUN_TEST(test_auth_batch_verify);
+    RUN_TEST(test_auth_cleanup_idempotent_and_param_defense);
     RUN_TEST(test_auth_cross_domain_unified);
     RUN_TEST(test_auth_mutual_and_session_key);
     RUN_TEST(test_auth_session_sm4_protect);

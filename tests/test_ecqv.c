@@ -310,6 +310,110 @@ static void test_cert_size_reduction_by_mask()
     TEST_PASS();
 }
 
+static void test_issue_ctx_accessor_and_param_defense()
+{
+    sm2_ic_issue_ctx_t issue_ctx;
+    sm2_ic_cert_request_t req;
+    sm2_private_key_t temp_priv;
+    uint8_t subject[] = "CTX_CASE";
+
+    TEST_ASSERT(sm2_ic_issue_ctx_get_field_mask(NULL) == SM2_IC_FIELD_MASK_ALL,
+        "Get Mask NULL Default");
+
+    sm2_ic_issue_ctx_init(&issue_ctx);
+    TEST_ASSERT(
+        sm2_ic_issue_ctx_get_field_mask(&issue_ctx) == SM2_IC_FIELD_MASK_ALL,
+        "Get Mask Default");
+
+    uint16_t custom_mask
+        = (uint16_t)(SM2_IC_FIELD_SUBJECT_ID | SM2_IC_FIELD_KEY_USAGE);
+    TEST_ASSERT(sm2_ic_issue_ctx_set_field_mask(&issue_ctx, custom_mask)
+            == SM2_IC_SUCCESS,
+        "Set Mask Custom");
+    TEST_ASSERT(sm2_ic_issue_ctx_get_field_mask(&issue_ctx) == custom_mask,
+        "Get Mask Custom");
+
+    TEST_ASSERT(
+        sm2_ic_issue_ctx_set_field_mask(&issue_ctx, 0xFFFF) == SM2_IC_ERR_PARAM,
+        "Set Mask Invalid");
+    TEST_ASSERT(
+        sm2_ic_issue_ctx_set_field_mask(NULL, custom_mask) == SM2_IC_ERR_PARAM,
+        "Set Mask NULL");
+
+    TEST_ASSERT(sm2_ic_create_cert_request(NULL, subject, sizeof(subject) - 1,
+                    SM2_KU_DIGITAL_SIGNATURE, &temp_priv)
+            == SM2_IC_ERR_PARAM,
+        "Create Req NULL Req");
+    TEST_ASSERT(sm2_ic_create_cert_request(&req, NULL, sizeof(subject) - 1,
+                    SM2_KU_DIGITAL_SIGNATURE, &temp_priv)
+            == SM2_IC_ERR_PARAM,
+        "Create Req NULL Subject");
+    TEST_ASSERT(sm2_ic_create_cert_request(&req, subject, sizeof(subject) - 1,
+                    SM2_KU_DIGITAL_SIGNATURE, NULL)
+            == SM2_IC_ERR_PARAM,
+        "Create Req NULL Temp");
+
+    TEST_PASS();
+}
+
+static void test_mask_zero_and_subject_id_boundary()
+{
+    if (!g_ca_initialized)
+        test_setup_ca();
+
+    uint8_t subject_id[256];
+    memset(subject_id, 0x5A, sizeof(subject_id));
+
+    sm2_ic_issue_ctx_t issue_ctx;
+    sm2_ic_cert_request_t req;
+    sm2_private_key_t temp_priv;
+    sm2_ic_cert_result_t cert_res;
+    sm2_private_key_t user_priv;
+    sm2_ec_point_t user_pub;
+    uint8_t cbor[1024];
+    size_t cbor_len = sizeof(cbor);
+
+    sm2_ic_issue_ctx_init(&issue_ctx);
+    TEST_ASSERT(
+        sm2_ic_issue_ctx_set_field_mask(&issue_ctx, 0) == SM2_IC_SUCCESS,
+        "Set Zero Mask");
+
+    TEST_ASSERT(sm2_ic_create_cert_request(&req, subject_id, sizeof(subject_id),
+                    SM2_KU_DIGITAL_SIGNATURE, &temp_priv)
+            == SM2_IC_SUCCESS,
+        "Create Req Subject 256");
+    TEST_ASSERT(sm2_ic_ca_generate_cert_with_ctx(&cert_res, &req,
+                    (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub, &issue_ctx)
+            == SM2_IC_SUCCESS,
+        "Issue Zero Mask Cert");
+
+    TEST_ASSERT(cert_res.cert.field_mask == 0, "Mask Zero Applied");
+    TEST_ASSERT(cert_res.cert.subject_id_len == 0, "Subject Removed");
+    TEST_ASSERT(cert_res.cert.issuer_id_len == 0, "Issuer Removed");
+    TEST_ASSERT(cert_res.cert.valid_from == 0, "ValidFrom Removed");
+    TEST_ASSERT(cert_res.cert.valid_duration == 0, "Duration Removed");
+    TEST_ASSERT(cert_res.cert.key_usage == 0, "Usage Removed");
+
+    TEST_ASSERT(sm2_ic_cbor_encode_cert(cbor, &cbor_len, &cert_res.cert)
+            == SM2_IC_SUCCESS,
+        "Encode Zero Mask Cert");
+    sm2_implicit_cert_t decoded;
+    TEST_ASSERT(
+        sm2_ic_cbor_decode_cert(&decoded, cbor, cbor_len) == SM2_IC_SUCCESS,
+        "Decode Zero Mask Cert");
+    TEST_ASSERT(decoded.field_mask == 0, "Decode Mask Zero");
+
+    TEST_ASSERT(sm2_ic_reconstruct_keys(
+                    &user_priv, &user_pub, &cert_res, &temp_priv, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Reconstruct Zero Mask Cert");
+    TEST_ASSERT(sm2_ic_verify_cert(&cert_res.cert, &user_pub, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Verify Zero Mask Cert");
+
+    TEST_PASS();
+}
+
 static void test_performance()
 {
     if (!g_ca_initialized)
@@ -386,6 +490,8 @@ void run_test_ecqv_suite(void)
     RUN_TEST(test_cbor_robustness);
     RUN_TEST(test_field_mask_template);
     RUN_TEST(test_cert_size_reduction_by_mask);
+    RUN_TEST(test_issue_ctx_accessor_and_param_defense);
+    RUN_TEST(test_mask_zero_and_subject_id_boundary);
     RUN_TEST(test_performance);
     RUN_TEST(test_chain_success_rate);
 }

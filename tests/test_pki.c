@@ -278,9 +278,108 @@ static void test_phase4_revocation_ocsp_and_cross_domain()
     TEST_PASS();
 }
 
+static void test_phase4_pki_controls_and_param_defense()
+{
+    sm2_pki_service_ctx_t service;
+    const uint8_t issuer[] = "CTRL_CA";
+    TEST_ASSERT(sm2_pki_service_init(
+                    &service, issuer, sizeof(issuer) - 1, 32, 300, 3000)
+            == SM2_PKI_SUCCESS,
+        "Service Init");
+
+    TEST_ASSERT(sm2_pki_service_set_cert_field_mask(NULL, SM2_IC_FIELD_MASK_ALL)
+            == SM2_PKI_ERR_PARAM,
+        "Set Mask NULL Ctx");
+    TEST_ASSERT(sm2_pki_service_set_cert_field_mask(&service, 0xFFFF)
+            == SM2_PKI_ERR_PARAM,
+        "Set Mask Invalid");
+    TEST_ASSERT(
+        sm2_pki_service_set_cert_field_mask(&service, 0) == SM2_PKI_SUCCESS,
+        "Set Mask Zero");
+
+    const uint8_t identity[] = "CTRL_NODE";
+    TEST_ASSERT(sm2_pki_identity_register(&service, identity,
+                    sizeof(identity) - 1, SM2_KU_DIGITAL_SIGNATURE)
+            == SM2_PKI_SUCCESS,
+        "Identity Register");
+
+    sm2_ic_cert_request_t req;
+    sm2_private_key_t temp_priv;
+    sm2_ic_cert_result_t cert_res;
+    TEST_ASSERT(sm2_pki_cert_request(
+                    &service, identity, sizeof(identity) - 1, &req, &temp_priv)
+            == SM2_PKI_SUCCESS,
+        "Cert Request");
+    TEST_ASSERT(
+        sm2_pki_cert_issue(&service, &req, &cert_res) == SM2_PKI_SUCCESS,
+        "Cert Issue");
+    TEST_ASSERT(cert_res.cert.field_mask == 0, "Issued Mask Zero");
+
+    sm2_ec_point_t ca_pub;
+    TEST_ASSERT(
+        sm2_pki_service_get_ca_public_key(&service, &ca_pub) == SM2_PKI_SUCCESS,
+        "Get CA Pub");
+
+    sm2_pki_client_ctx_t client;
+    TEST_ASSERT(sm2_pki_client_init(&client, &ca_pub, &service.rev_ctx)
+            == SM2_PKI_SUCCESS,
+        "Client Init");
+    TEST_ASSERT(
+        sm2_pki_client_add_trusted_ca(&client, NULL) == SM2_PKI_ERR_PARAM,
+        "Add Trusted NULL");
+
+    TEST_ASSERT(
+        sm2_pki_client_enable_precompute(&client, 32, 16) == SM2_PKI_ERR_PARAM,
+        "Enable Precompute Without Keys");
+
+    TEST_ASSERT(
+        sm2_pki_client_import_cert(&client, &cert_res, &temp_priv, &ca_pub)
+            == SM2_PKI_SUCCESS,
+        "Import Cert");
+    TEST_ASSERT(
+        sm2_pki_client_enable_precompute(&client, 0, 0) == SM2_PKI_ERR_PARAM,
+        "Enable Precompute Zero Capacity");
+    TEST_ASSERT(
+        sm2_pki_client_enable_precompute(&client, 32, 16) == SM2_PKI_SUCCESS,
+        "Enable Precompute");
+
+    sm2_pki_client_disable_precompute(&client);
+    TEST_ASSERT(!client.precompute_enabled, "Disable Precompute");
+    sm2_pki_client_disable_precompute(&client);
+    TEST_ASSERT(!client.precompute_enabled, "Disable Precompute Idempotent");
+
+    const uint8_t msg[] = "CTRL_SIGN";
+    sm2_auth_signature_t sig;
+    TEST_ASSERT(
+        sm2_pki_sign(&client, msg, sizeof(msg) - 1, &sig) == SM2_PKI_SUCCESS,
+        "Sign After Disable");
+
+    size_t valid_count = 0;
+    TEST_ASSERT(
+        sm2_pki_batch_verify(NULL, 1, &valid_count) == SM2_PKI_ERR_PARAM,
+        "Batch Verify NULL Items");
+
+    uint8_t session_key[16];
+    TEST_ASSERT(
+        sm2_pki_key_agreement(&client, NULL, session_key, sizeof(session_key))
+            == SM2_PKI_ERR_PARAM,
+        "Key Agreement NULL Peer");
+
+    uint8_t iv[16] = { 0 };
+    TEST_ASSERT(sm2_pki_encrypt(
+                    session_key, iv, msg, sizeof(msg) - 1, NULL, &valid_count)
+            == SM2_PKI_ERR_PARAM,
+        "Encrypt NULL Ciphertext");
+
+    sm2_pki_client_cleanup(&client);
+    sm2_pki_service_cleanup(&service);
+    TEST_PASS();
+}
+
 void run_test_pki_suite(void)
 {
     RUN_TEST(test_phase4_service_client_flow);
     RUN_TEST(test_phase4_revocation_ocsp_and_cross_domain);
+    RUN_TEST(test_phase4_pki_controls_and_param_defense);
     RUN_TEST(test_x509_real_baseline_size);
 }
