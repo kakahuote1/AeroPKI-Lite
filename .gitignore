@@ -1,0 +1,23 @@
+# Build artifacts
+*.o
+*.obj
+*.exe
+out/
+tmp/
+build/
+cmake-build-*/
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+internal_doc/
+
+# Optional local IDE settings
+.vscode/
+.idea/
+
+# OS / debug artifacts
+*.dSYM/
+*.pdb
+*.ilk
+*.stackdump
+*.core

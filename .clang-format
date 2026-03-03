@@ -1,0 +1,18 @@
+BasedOnStyle: WebKit
+Language: Cpp
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 80
+BreakBeforeBraces: Allman
+AllowShortIfStatementsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: None
+PointerAlignment: Right
+AlignConsecutiveDeclarations: false
+AlignConsecutiveAssignments: false
+SortIncludes: false
+ReflowComments: true
+IndentCaseLabels: true
+SpaceBeforeParens: ControlStatements
+
