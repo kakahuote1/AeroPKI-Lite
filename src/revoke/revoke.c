@@ -1,189 +1,23 @@
 ﻿/* SPDX-License-Identifier: Apache-2.0 */
 
 /**
- * @file sm2_revocation.c
- * @brief Online/offline revocation manager based on OCSP + incremental CRL +
- * Cuckoo Filter.
+ * @file revoke.c
+ * @brief Revocation state management and OCSP/CRL query path.
  */
 
-#include "sm2_revocation.h"
+#include "revoke_internal.h"
 #include <stdlib.h>
 #include <string.h>
 
-static uint64_t utils_mix_u64(uint64_t x)
-{
-    x ^= x >> 33;
-    x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33;
-    x *= 0xc4ceb9fe1a85ec53ULL;
-    x ^= x >> 33;
-    return x;
-}
-
-static uint64_t utils_hash_u64_sm3_tag(uint64_t v, uint8_t tag)
-{
-    uint8_t in[9];
-    uint8_t out[SM3_DIGEST_LENGTH];
-    in[0] = tag;
-    for (int i = 0; i < 8; i++)
-        in[8 - i] = (uint8_t)((v >> (i * 8)) & 0xFF);
-    if (sm2_ic_sm3_hash(in, sizeof(in), out) != SM2_IC_SUCCESS)
-        return utils_mix_u64(v);
-
-    uint64_t h = 0;
-    for (int i = 0; i < 8; i++)
-        h = (h << 8) | out[i];
-    return h;
-}
-
-static size_t utils_next_pow2(size_t v)
-{
-    size_t p = 1;
-    while (p < v)
-        p <<= 1;
-    return p;
-}
-
-static uint32_t cuckoo_fp(const sm2_cuckoo_filter_t *f, uint64_t serial)
-{
-    if (!f || f->fp_bits == 0 || f->fp_bits > 32)
-        return 1;
-    uint64_t h = utils_hash_u64_sm3_tag(serial, 0xA1);
-    uint32_t mask
-        = (f->fp_bits == 32) ? 0xFFFFFFFFU : ((1U << f->fp_bits) - 1U);
-    uint32_t fp = (uint32_t)(h & mask);
-    return fp == 0 ? 1 : fp;
-}
-
-static size_t cuckoo_index1(const sm2_cuckoo_filter_t *f, uint64_t serial)
-{
-    return (size_t)(utils_hash_u64_sm3_tag(serial, 0xB2)
-        & (uint64_t)(f->bucket_count - 1));
-}
-
-static size_t cuckoo_index2(
-    const sm2_cuckoo_filter_t *f, size_t i1, uint32_t fp)
-{
-    uint64_t h = utils_hash_u64_sm3_tag((uint64_t)fp, 0xC3);
-    return (size_t)((i1 ^ (size_t)h) & (f->bucket_count - 1));
-}
-
-static uint32_t *cuckoo_bucket_slot(
-    const sm2_cuckoo_filter_t *f, size_t bucket, size_t slot)
-{
-    return &f->fingerprints[bucket * f->bucket_size + slot];
-}
-
-static bool cuckoo_contains(const sm2_cuckoo_filter_t *f, uint64_t serial)
-{
-    uint32_t fp = cuckoo_fp(f, serial);
-    size_t i1 = cuckoo_index1(f, serial);
-    size_t i2 = cuckoo_index2(f, i1, fp);
-
-    for (size_t s = 0; s < f->bucket_size; s++)
-    {
-        if (*cuckoo_bucket_slot(f, i1, s) == fp)
-            return true;
-        if (*cuckoo_bucket_slot(f, i2, s) == fp)
-            return true;
-    }
-    return false;
-}
-
-static bool cuckoo_delete(sm2_cuckoo_filter_t *f, uint64_t serial)
-{
-    uint32_t fp = cuckoo_fp(f, serial);
-    size_t i1 = cuckoo_index1(f, serial);
-    size_t i2 = cuckoo_index2(f, i1, fp);
-
-    for (size_t s = 0; s < f->bucket_size; s++)
-    {
-        uint32_t *a = cuckoo_bucket_slot(f, i1, s);
-        if (*a == fp)
-        {
-            *a = 0;
-            return true;
-        }
-        uint32_t *b = cuckoo_bucket_slot(f, i2, s);
-        if (*b == fp)
-        {
-            *b = 0;
-            return true;
-        }
-    }
-    return false;
-}
-
-static sm2_ic_error_t cuckoo_insert(sm2_cuckoo_filter_t *f, uint64_t serial)
-{
-    uint32_t fp = cuckoo_fp(f, serial);
-    size_t i1 = cuckoo_index1(f, serial);
-    size_t i2 = cuckoo_index2(f, i1, fp);
-
-    for (size_t s = 0; s < f->bucket_size; s++)
-    {
-        uint32_t *a = cuckoo_bucket_slot(f, i1, s);
-        if (*a == 0)
-        {
-            *a = fp;
-            return SM2_IC_SUCCESS;
-        }
-        uint32_t *b = cuckoo_bucket_slot(f, i2, s);
-        if (*b == 0)
-        {
-            *b = fp;
-            return SM2_IC_SUCCESS;
-        }
-    }
-
-    size_t idx = (utils_hash_u64_sm3_tag(serial, 0xD4) & 1U) ? i1 : i2;
-    uint32_t cur_fp = fp;
-
-    for (size_t kick = 0; kick < f->max_kicks; kick++)
-    {
-        size_t slot = (size_t)(utils_hash_u64_sm3_tag(
-                                   ((uint64_t)cur_fp << 32) | kick, 0xE5)
-            % f->bucket_size);
-        uint32_t *target = cuckoo_bucket_slot(f, idx, slot);
-        uint32_t victim = *target;
-        *target = cur_fp;
-        cur_fp = victim;
-
-        idx = cuckoo_index2(f, idx, cur_fp);
-        for (size_t s = 0; s < f->bucket_size; s++)
-        {
-            uint32_t *cand = cuckoo_bucket_slot(f, idx, s);
-            if (*cand == 0)
-            {
-                *cand = cur_fp;
-                return SM2_IC_SUCCESS;
-            }
-        }
-    }
-    return SM2_IC_ERR_MEMORY;
-}
-
-static sm2_ic_error_t cuckoo_reset(sm2_cuckoo_filter_t *f, size_t bucket_count,
-    size_t bucket_size, size_t max_kicks, uint8_t fp_bits)
-{
-    if (!f || bucket_count == 0 || bucket_size == 0)
-        return SM2_IC_ERR_PARAM;
-    if (fp_bits == 0 || fp_bits > 32)
-        return SM2_IC_ERR_PARAM;
-
-    uint32_t *new_mem
-        = (uint32_t *)calloc(bucket_count * bucket_size, sizeof(uint32_t));
-    if (!new_mem)
-        return SM2_IC_ERR_MEMORY;
-
-    free(f->fingerprints);
-    f->fingerprints = new_mem;
-    f->bucket_count = bucket_count;
-    f->bucket_size = bucket_size;
-    f->max_kicks = max_kicks;
-    f->fp_bits = fp_bits;
-    return SM2_IC_SUCCESS;
-}
+#define utils_next_pow2 sm2_rev_internal_next_pow2
+#define utils_refresh_filter_param_hash                                        \
+    sm2_rev_internal_refresh_filter_param_hash
+#define cuckoo_reset sm2_rev_internal_cuckoo_reset
+#define cuckoo_insert sm2_rev_internal_cuckoo_insert
+#define cuckoo_delete sm2_rev_internal_cuckoo_delete
+#define cuckoo_contains sm2_rev_internal_cuckoo_contains
+#define rebuild_filter sm2_rev_internal_rebuild_filter
+#define sync_log_append sm2_rev_internal_sync_log_append
 
 static sm2_ic_error_t local_list_add(sm2_revocation_ctx_t *ctx, uint64_t serial)
 {
@@ -223,24 +57,16 @@ static void local_list_remove(sm2_revocation_ctx_t *ctx, uint64_t serial)
     }
 }
 
-static sm2_ic_error_t rebuild_filter(sm2_revocation_ctx_t *ctx)
+sm2_ic_error_t sm2_rev_internal_local_list_add(
+    sm2_revocation_ctx_t *ctx, uint64_t serial)
 {
-    size_t min_buckets = utils_next_pow2((ctx->revoked_count / 3) + 64);
-    if (min_buckets < 64)
-        min_buckets = 64;
+    return local_list_add(ctx, serial);
+}
 
-    sm2_ic_error_t ret = cuckoo_reset(&ctx->filter, min_buckets,
-        ctx->filter.bucket_size, ctx->filter.max_kicks, ctx->filter.fp_bits);
-    if (ret != SM2_IC_SUCCESS)
-        return ret;
-
-    for (size_t i = 0; i < ctx->revoked_count; i++)
-    {
-        ret = cuckoo_insert(&ctx->filter, ctx->revoked_serials[i]);
-        if (ret != SM2_IC_SUCCESS)
-            return ret;
-    }
-    return SM2_IC_SUCCESS;
+void sm2_rev_internal_local_list_remove(
+    sm2_revocation_ctx_t *ctx, uint64_t serial)
+{
+    local_list_remove(ctx, serial);
 }
 
 static sm2_ocsp_cache_entry_t *cache_find(
@@ -304,7 +130,16 @@ sm2_ic_error_t sm2_revocation_init(sm2_revocation_ctx_t *ctx,
     ctx->filter_expire_at = now_ts + filter_ttl_sec;
     ctx->crl_version = 0;
     ctx->online_mode = false;
-    return SM2_IC_SUCCESS;
+
+    ctx->sync_epoch = 1;
+    ctx->sync_log_window = 2048;
+    ctx->sync_log_head = 0;
+    ctx->last_sync_ts = 0;
+    ctx->last_sync_nonce = 0;
+    ctx->sync_max_items_per_packet = 256;
+    ctx->sync_min_export_interval_sec = 0;
+
+    return utils_refresh_filter_param_hash(ctx);
 }
 
 void sm2_revocation_cleanup(sm2_revocation_ctx_t *ctx)
@@ -314,6 +149,7 @@ void sm2_revocation_cleanup(sm2_revocation_ctx_t *ctx)
     free(ctx->filter.fingerprints);
     free(ctx->revoked_serials);
     free(ctx->ocsp_cache);
+    free(ctx->sync_log);
     memset(ctx, 0, sizeof(*ctx));
 }
 
@@ -404,6 +240,11 @@ sm2_ic_error_t sm2_revocation_apply_crl_delta(
                     return ret;
             }
         }
+
+        sm2_ic_error_t log_ret = sync_log_append(ctx, delta->base_version,
+            delta->new_version, now_ts, it->serial_number, it->revoked);
+        if (log_ret != SM2_IC_SUCCESS)
+            return log_ret;
     }
 
     ctx->crl_version = delta->new_version;

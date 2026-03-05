@@ -1,0 +1,21 @@
+CMakeFiles/sm2ecqv.dir/src/pki/service.c.obj: \
+ D:\cursor\workplace\AeroPKI-Lite\src\pki\service.c \
+ D:/cursor/workplace/AeroPKI-Lite/include/sm2_pki_service.h \
+ D:/MinGW-W64/ucrt64/lib/gcc/x86_64-w64-mingw32/15.1.0/include/stddef.h \
+ D:/MinGW-W64/ucrt64/include/stddef.h \
+ D:/MinGW-W64/ucrt64/include/crtdefs.h \
+ D:/MinGW-W64/ucrt64/include/corecrt.h \
+ D:/MinGW-W64/ucrt64/include/_mingw.h \
+ D:/MinGW-W64/ucrt64/include/_mingw_mac.h \
+ D:/MinGW-W64/ucrt64/include/_mingw_secapi.h \
+ D:/MinGW-W64/ucrt64/include/vadefs.h \
+ D:/MinGW-W64/ucrt64/include/sdks/_mingw_ddk.h \
+ D:/MinGW-W64/ucrt64/lib/gcc/x86_64-w64-mingw32/15.1.0/include/stdint.h \
+ D:/MinGW-W64/ucrt64/include/stdint.h \
+ D:/MinGW-W64/ucrt64/lib/gcc/x86_64-w64-mingw32/15.1.0/include/stdbool.h \
+ D:/cursor/workplace/AeroPKI-Lite/include/sm2_crypto.h \
+ D:/cursor/workplace/AeroPKI-Lite/include/sm2_auth.h \
+ D:/cursor/workplace/AeroPKI-Lite/include/sm2_implicit_cert.h \
+ D:/cursor/workplace/AeroPKI-Lite/include/sm2_revocation.h \
+ D:/MinGW-W64/ucrt64/include/string.h \
+ D:/MinGW-W64/ucrt64/include/sec_api/string_s.h
