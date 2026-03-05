@@ -4,15 +4,13 @@
 [![Language](https://img.shields.io/badge/Language-C11-orange.svg)]()
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg)]()
 
-面向航空/无人机受限环境的轻量化 PKI 原型，基于 `SM2 + SM3 + SM4` 与 `ECQV` 隐式证书机制实现。
-
-## 📖 项目背景与核心设计
-
 <p align="center">
   <span style="font-size:18px">
     <b>AeroPKI-Lite</b> 是一个纯 C11 语言编写的 PKI 协议栈，底层依赖 OpenSSL 3.0 EVP 接口，深度融合了 <b>ECQV 隐式证书</b> 与 <b>国密商用密码算法（SM2/SM3/SM4）</b>。
   </span>
 </p>
+
+## 📖 项目背景与核心设计
 
 针对航空链路环境中普遍面临的**终端资源受限**、**信号链路不稳定**、以及**核心节点高并发压力**三大原生约束，本项目给出了一套从底层算法到系统工程化的全链路解答：
 
@@ -88,13 +86,11 @@ ctest --test-dir build_local --output-on-failure
 ./build_local/test_all.exe
 ```
 
-> **当前回归质量基线**：`43 Run, 43 Passed, 0 Failed`。
-
 ---
 
 ## 💻 完整编程演示程序
 
-为了快速上手业务流，我们在 `src/app/` 下提供了可独立编译与运行的 Demo 程序（内置详细断点与步骤注释）。
+为了快速上手业务流，我们在 `src/app/` 下提供了可独立编译与运行的 Demo 程序。
 
 ### 📜 核心流：证书签发 -> 验签 -> 吊销拦截
 
