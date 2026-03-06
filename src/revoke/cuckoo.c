@@ -234,9 +234,14 @@ static sm2_ic_error_t cuckoo_reset(sm2_cuckoo_filter_t *f, size_t bucket_count,
         return SM2_IC_ERR_PARAM;
     if (fp_bits == 0 || fp_bits > 32)
         return SM2_IC_ERR_PARAM;
+    if (bucket_count > (SIZE_MAX / bucket_size))
+        return SM2_IC_ERR_PARAM;
 
-    uint32_t *new_mem
-        = (uint32_t *)calloc(bucket_count * bucket_size, sizeof(uint32_t));
+    size_t total_slots = bucket_count * bucket_size;
+    if (total_slots > (SIZE_MAX / sizeof(uint32_t)))
+        return SM2_IC_ERR_PARAM;
+
+    uint32_t *new_mem = (uint32_t *)calloc(total_slots, sizeof(uint32_t));
     if (!new_mem)
         return SM2_IC_ERR_MEMORY;
 
@@ -248,7 +253,6 @@ static sm2_ic_error_t cuckoo_reset(sm2_cuckoo_filter_t *f, size_t bucket_count,
     f->fp_bits = fp_bits;
     return SM2_IC_SUCCESS;
 }
-
 static sm2_ic_error_t rebuild_filter(sm2_revocation_ctx_t *ctx)
 {
     size_t min_buckets = utils_next_pow2((ctx->revoked_count / 3) + 64);

@@ -6,6 +6,7 @@
  */
 
 #include "sm2_pki_client.h"
+#include "sm2_secure_mem.h"
 #include <string.h>
 
 sm2_pki_error_t sm2_pki_client_init(sm2_pki_client_ctx_t *ctx,
@@ -37,7 +38,7 @@ void sm2_pki_client_cleanup(sm2_pki_client_ctx_t *ctx)
     if (!ctx)
         return;
     sm2_pki_client_disable_precompute(ctx);
-    memset(ctx, 0, sizeof(*ctx));
+    sm2_secure_memzero(ctx, sizeof(*ctx));
 }
 
 sm2_pki_error_t sm2_pki_client_add_trusted_ca(

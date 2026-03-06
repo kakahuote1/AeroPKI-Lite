@@ -1008,6 +1008,156 @@ static void test_revocation_sync_adaptive_bucket_summary()
     TEST_PASS();
 }
 
+static void test_revocation_sync_log_compact_memory_target()
+{
+    size_t entry_size = sizeof(sm2_rev_sync_log_entry_t);
+    size_t window_mem = entry_size * 2048U;
+
+    printf("   [SYNC-LOG-MEM] entry=%zuB, window2048=%zuB\n", entry_size,
+        window_mem);
+
+    TEST_ASSERT(entry_size <= 16U, "Compact Entry > 16B");
+    TEST_ASSERT(window_mem <= 40U * 1024U, "Window Memory > 40KB");
+    TEST_PASS();
+}
+
+static void test_revocation_sync_large_version_jump_rebase()
+{
+    sm2_revocation_ctx_t a;
+    sm2_revocation_ctx_t b;
+    mock_sync_sig_state_t sig_state;
+    memset(&sig_state, 0, sizeof(sig_state));
+    sig_state.key = 0x8E;
+
+    TEST_ASSERT(
+        sm2_revocation_init(&a, 128, 300, 100) == SM2_IC_SUCCESS, "Init A");
+    TEST_ASSERT(
+        sm2_revocation_init(&b, 128, 300, 100) == SM2_IC_SUCCESS, "Init B");
+    TEST_ASSERT(sm2_revocation_set_sync_identity(
+                    &a, (const uint8_t *)"NODE_A", 6, 1, 2048)
+            == SM2_IC_SUCCESS,
+        "Identity A");
+    TEST_ASSERT(sm2_revocation_set_sync_identity(
+                    &b, (const uint8_t *)"NODE_B", 6, 1, 2048)
+            == SM2_IC_SUCCESS,
+        "Identity B");
+
+    sm2_crl_delta_item_t d1_items[] = { { 880801, true } };
+    sm2_crl_delta_t d1 = { 0, 1, d1_items, 1 };
+    TEST_ASSERT(sm2_revocation_apply_crl_delta(&a, &d1, 120) == SM2_IC_SUCCESS,
+        "A Apply v1");
+    TEST_ASSERT(sm2_revocation_apply_crl_delta(&b, &d1, 120) == SM2_IC_SUCCESS,
+        "B Apply v1");
+
+    sm2_crl_delta_item_t d2_items[] = { { 880802, true } };
+    sm2_crl_delta_t d2 = { 1, 70001, d2_items, 1 };
+    TEST_ASSERT(sm2_revocation_apply_crl_delta(&a, &d2, 121) == SM2_IC_SUCCESS,
+        "A Apply Jump v70001");
+
+    sm2_rev_sync_hello_t hb;
+    sm2_rev_sync_plan_t plan;
+    sm2_rev_sync_packet_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+
+    TEST_ASSERT(
+        sm2_revocation_sync_hello(&b, 130, &hb) == SM2_IC_SUCCESS, "Hello B");
+    TEST_ASSERT(sm2_revocation_sync_plan(&a, &hb, &plan) == SM2_IC_SUCCESS,
+        "Plan A->B");
+    TEST_ASSERT(plan.action == SM2_REV_SYNC_ACTION_DELTA,
+        "Jump Version Should Still Delta");
+
+    TEST_ASSERT(sm2_revocation_sync_export_delta(
+                    &a, &plan, 131, 12001, mock_sync_sign, &sig_state, &pkt)
+            == SM2_IC_SUCCESS,
+        "Export Delta");
+    TEST_ASSERT(
+        sm2_revocation_sync_apply(&b, &pkt, 132, mock_sync_verify, &sig_state)
+            == SM2_IC_SUCCESS,
+        "Apply Delta");
+
+    sm2_rev_status_t status;
+    sm2_rev_source_t source;
+    TEST_ASSERT(sm2_revocation_query(&b, 880802, 133, &status, &source)
+            == SM2_IC_SUCCESS,
+        "Query Jump Serial");
+    TEST_ASSERT(status == SM2_REV_STATUS_REVOKED, "Jump Serial Revoked");
+
+    sm2_revocation_sync_packet_cleanup(&pkt);
+    sm2_revocation_cleanup(&b);
+    sm2_revocation_cleanup(&a);
+    TEST_PASS();
+}
+
+static void test_revocation_sync_timestamp_offset_overflow_rebase()
+{
+    sm2_revocation_ctx_t a;
+    sm2_revocation_ctx_t b;
+    mock_sync_sig_state_t sig_state;
+    memset(&sig_state, 0, sizeof(sig_state));
+    sig_state.key = 0x9F;
+
+    TEST_ASSERT(
+        sm2_revocation_init(&a, 128, 300, 100) == SM2_IC_SUCCESS, "Init A");
+    TEST_ASSERT(
+        sm2_revocation_init(&b, 128, 300, 100) == SM2_IC_SUCCESS, "Init B");
+    TEST_ASSERT(sm2_revocation_set_sync_identity(
+                    &a, (const uint8_t *)"NODE_A", 6, 1, 2048)
+            == SM2_IC_SUCCESS,
+        "Identity A");
+    TEST_ASSERT(sm2_revocation_set_sync_identity(
+                    &b, (const uint8_t *)"NODE_B", 6, 1, 2048)
+            == SM2_IC_SUCCESS,
+        "Identity B");
+
+    sm2_crl_delta_item_t d1_items[] = { { 880901, true } };
+    sm2_crl_delta_t d1 = { 0, 1, d1_items, 1 };
+    TEST_ASSERT(sm2_revocation_apply_crl_delta(&a, &d1, 120) == SM2_IC_SUCCESS,
+        "A Apply v1");
+    TEST_ASSERT(sm2_revocation_apply_crl_delta(&b, &d1, 120) == SM2_IC_SUCCESS,
+        "B Apply v1");
+
+    uint64_t large_ts = 120ULL + (uint64_t)UINT32_MAX + 4096ULL;
+    sm2_crl_delta_item_t d2_items[] = { { 880902, true } };
+    sm2_crl_delta_t d2 = { 1, 2, d2_items, 1 };
+    TEST_ASSERT(
+        sm2_revocation_apply_crl_delta(&a, &d2, large_ts) == SM2_IC_SUCCESS,
+        "A Apply Timestamp Overflow Delta");
+
+    sm2_rev_sync_hello_t hb;
+    sm2_rev_sync_plan_t plan;
+    sm2_rev_sync_packet_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+
+    TEST_ASSERT(
+        sm2_revocation_sync_hello(&b, large_ts + 1, &hb) == SM2_IC_SUCCESS,
+        "Hello B");
+    TEST_ASSERT(sm2_revocation_sync_plan(&a, &hb, &plan) == SM2_IC_SUCCESS,
+        "Plan A->B");
+    TEST_ASSERT(plan.action == SM2_REV_SYNC_ACTION_DELTA,
+        "Timestamp Overflow Should Keep Delta");
+
+    TEST_ASSERT(sm2_revocation_sync_export_delta(&a, &plan, large_ts + 2, 13001,
+                    mock_sync_sign, &sig_state, &pkt)
+            == SM2_IC_SUCCESS,
+        "Export Delta");
+    TEST_ASSERT(sm2_revocation_sync_apply(
+                    &b, &pkt, large_ts + 3, mock_sync_verify, &sig_state)
+            == SM2_IC_SUCCESS,
+        "Apply Delta");
+
+    sm2_rev_status_t status;
+    sm2_rev_source_t source;
+    TEST_ASSERT(sm2_revocation_query(&b, 880902, large_ts + 4, &status, &source)
+            == SM2_IC_SUCCESS,
+        "Query Timestamp Overflow Serial");
+    TEST_ASSERT(
+        status == SM2_REV_STATUS_REVOKED, "Timestamp Overflow Serial Revoked");
+
+    sm2_revocation_sync_packet_cleanup(&pkt);
+    sm2_revocation_cleanup(&b);
+    sm2_revocation_cleanup(&a);
+    TEST_PASS();
+}
 void run_test_sync_suite(void)
 {
     RUN_TEST(test_revocation_sync_delta_roundtrip);
@@ -1022,4 +1172,7 @@ void run_test_sync_suite(void)
     RUN_TEST(test_revocation_sync_constrained_fpr_after_sync);
     RUN_TEST(test_revocation_sync_log_ring_window_stability);
     RUN_TEST(test_revocation_sync_adaptive_bucket_summary);
+    RUN_TEST(test_revocation_sync_log_compact_memory_target);
+    RUN_TEST(test_revocation_sync_large_version_jump_rebase);
+    RUN_TEST(test_revocation_sync_timestamp_offset_overflow_rebase);
 }

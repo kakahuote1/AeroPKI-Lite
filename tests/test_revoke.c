@@ -16,6 +16,11 @@ typedef struct
     size_t idx;
     int call_count;
 } jitter_ocsp_state_t;
+typedef struct
+{
+    int fail_mode;
+    int call_count;
+} expiry_ocsp_state_t;
 
 static sm2_ic_error_t mock_ocsp_query(void *user_ctx, uint64_t serial_number,
     uint32_t timeout_ms, sm2_ocsp_response_t *response)
@@ -54,6 +59,29 @@ static sm2_ic_error_t jitter_ocsp_query(void *user_ctx, uint64_t serial_number,
     return SM2_IC_SUCCESS;
 }
 
+static sm2_ic_error_t expiry_ocsp_query(void *user_ctx, uint64_t serial_number,
+    uint32_t timeout_ms, sm2_ocsp_response_t *response)
+{
+    (void)timeout_ms;
+    expiry_ocsp_state_t *st = (expiry_ocsp_state_t *)user_ctx;
+    if (!st || !response)
+        return SM2_IC_ERR_PARAM;
+
+    st->call_count++;
+    if (st->fail_mode)
+        return SM2_IC_ERR_CRYPTO;
+
+    response->serial_number = serial_number;
+    response->status = SM2_REV_STATUS_GOOD;
+    response->this_update = 1000;
+    if (serial_number == 100)
+        response->next_update = 2500;
+    else if (serial_number == 200)
+        response->next_update = 1200;
+    else
+        response->next_update = 3000;
+    return SM2_IC_SUCCESS;
+}
 static void test_revocation_online_ocsp_and_cache()
 {
     sm2_revocation_ctx_t ctx;
@@ -134,6 +162,55 @@ static void test_revocation_online_fallback_to_local()
     TEST_PASS();
 }
 
+static void test_revocation_ocsp_cache_eviction_policy()
+{
+    sm2_revocation_ctx_t ctx;
+    expiry_ocsp_state_t state;
+    memset(&state, 0, sizeof(state));
+
+    TEST_ASSERT(sm2_revocation_init(&ctx, 16, 300, 100) == SM2_IC_SUCCESS,
+        "Revocation Init");
+    TEST_ASSERT(
+        sm2_revocation_set_online(&ctx, true) == SM2_IC_SUCCESS, "Set Online");
+
+    sm2_ocsp_client_cfg_t ocsp_cfg;
+    memset(&ocsp_cfg, 0, sizeof(ocsp_cfg));
+    ocsp_cfg.query_fn = expiry_ocsp_query;
+    ocsp_cfg.user_ctx = &state;
+    ocsp_cfg.timeout_ms = 100;
+    ocsp_cfg.retry_count = 1;
+    ocsp_cfg.cache_capacity = 2;
+    TEST_ASSERT(sm2_revocation_config_ocsp(&ctx, &ocsp_cfg) == SM2_IC_SUCCESS,
+        "Config OCSP");
+
+    sm2_rev_status_t status;
+    sm2_rev_source_t source;
+    TEST_ASSERT(sm2_revocation_query(&ctx, 100, 110, &status, &source)
+            == SM2_IC_SUCCESS,
+        "Prime Cache Serial 100");
+    TEST_ASSERT(sm2_revocation_query(&ctx, 200, 111, &status, &source)
+            == SM2_IC_SUCCESS,
+        "Prime Cache Serial 200");
+    TEST_ASSERT(sm2_revocation_query(&ctx, 300, 112, &status, &source)
+            == SM2_IC_SUCCESS,
+        "Trigger Eviction");
+
+    state.fail_mode = 1;
+    TEST_ASSERT(sm2_revocation_query(&ctx, 100, 113, &status, &source)
+            == SM2_IC_SUCCESS,
+        "Serial 100 Should Remain Cached");
+    TEST_ASSERT(source == SM2_REV_SOURCE_OCSP_CACHE, "Cache Keeps Newer Entry");
+
+    TEST_ASSERT(sm2_revocation_query(&ctx, 200, 113, &status, &source)
+            == SM2_IC_SUCCESS,
+        "Serial 200 Should Fall Back");
+    TEST_ASSERT(source == SM2_REV_SOURCE_LOCAL_FILTER,
+        "Evicted Entry Falls Back Local");
+    TEST_ASSERT(status == SM2_REV_STATUS_GOOD, "Fallback Good");
+
+    sm2_revocation_cleanup(&ctx);
+    TEST_PASS();
+}
 static void test_revocation_ocsp_latency_sla()
 {
     sm2_revocation_ctx_t ctx;
@@ -287,6 +364,7 @@ void run_test_revoke_suite(void)
 {
     run_test_cuckoo_suite();
     RUN_TEST(test_revocation_online_ocsp_and_cache);
+    RUN_TEST(test_revocation_ocsp_cache_eviction_policy);
     RUN_TEST(test_revocation_online_fallback_to_local);
     RUN_TEST(test_revocation_network_jitter_sequence);
     RUN_TEST(test_revocation_ocsp_latency_sla);

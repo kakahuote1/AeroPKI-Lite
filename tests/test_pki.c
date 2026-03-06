@@ -2,6 +2,9 @@
 
 #include "test_common.h"
 #include <openssl/evp.h>
+#include <openssl/bn.h>
+#include <openssl/ec.h>
+#include <openssl/obj_mac.h>
 #include <openssl/rsa.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
@@ -159,6 +162,8 @@ static void test_phase4_service_client_flow()
         memcmp(recover, plain, sizeof(plain) - 1) == 0, "Recover Plain");
 
     sm2_pki_client_cleanup(&client);
+    sm2_pki_client_cleanup(&client);
+    sm2_pki_service_cleanup(&service);
     sm2_pki_service_cleanup(&service);
     TEST_PASS();
 }
@@ -372,14 +377,53 @@ static void test_phase4_pki_controls_and_param_defense()
         "Encrypt NULL Ciphertext");
 
     sm2_pki_client_cleanup(&client);
+    sm2_pki_client_cleanup(&client);
+    sm2_pki_service_cleanup(&service);
     sm2_pki_service_cleanup(&service);
     TEST_PASS();
 }
 
+static void test_phase7_service_ca_key_range_check()
+{
+    EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_sm2);
+    BIGNUM *order = BN_new();
+    BIGNUM *upper_bound = BN_new();
+
+    TEST_ASSERT(group != NULL && order != NULL && upper_bound != NULL,
+        "Alloc SM2 Range Objects");
+    TEST_ASSERT(
+        EC_GROUP_get_order(group, order, NULL) == 1, "Read Curve Order");
+    TEST_ASSERT(BN_copy(upper_bound, order) != NULL, "Copy Order");
+    TEST_ASSERT(BN_sub_word(upper_bound, 2), "Order Minus Two");
+
+    for (size_t i = 0; i < 16; i++)
+    {
+        sm2_pki_service_ctx_t service;
+        const uint8_t issuer[] = "P7_CA";
+        TEST_ASSERT(sm2_pki_service_init(&service, issuer, sizeof(issuer) - 1,
+                        16, 300, (uint64_t)(5000 + i))
+                == SM2_PKI_SUCCESS,
+            "Service Init");
+
+        BIGNUM *d = BN_bin2bn(service.ca_private_key.d, SM2_KEY_LEN, NULL);
+        TEST_ASSERT(d != NULL, "CA Private To BN");
+        TEST_ASSERT(!BN_is_zero(d) && !BN_is_negative(d), "CA Private > 0");
+        TEST_ASSERT(BN_cmp(d, upper_bound) <= 0, "CA Private <= n-2");
+
+        BN_clear_free(d);
+        sm2_pki_service_cleanup(&service);
+    }
+
+    BN_free(upper_bound);
+    BN_free(order);
+    EC_GROUP_free(group);
+    TEST_PASS();
+}
 void run_test_pki_suite(void)
 {
     RUN_TEST(test_phase4_service_client_flow);
     RUN_TEST(test_phase4_revocation_ocsp_and_cross_domain);
     RUN_TEST(test_phase4_pki_controls_and_param_defense);
     RUN_TEST(test_x509_real_baseline_size);
+    RUN_TEST(test_phase7_service_ca_key_range_check);
 }

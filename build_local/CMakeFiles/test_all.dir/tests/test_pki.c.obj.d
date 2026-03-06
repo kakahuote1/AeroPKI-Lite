@@ -333,14 +333,14 @@ CMakeFiles/test_all.dir/tests/test_pki.c.obj: \
  D:/MinGW-W64/ucrt64/include/openssl/asn1.h \
  D:/MinGW-W64/ucrt64/include/openssl/asn1err.h \
  D:/MinGW-W64/ucrt64/include/openssl/objectserr.h \
+ D:/MinGW-W64/ucrt64/include/openssl/ec.h \
+ D:/MinGW-W64/ucrt64/include/openssl/ecerr.h \
  D:/MinGW-W64/ucrt64/include/openssl/rsa.h \
  D:/MinGW-W64/ucrt64/include/openssl/rsaerr.h \
  D:/MinGW-W64/ucrt64/include/openssl/x509.h \
  D:/MinGW-W64/ucrt64/include/openssl/buffer.h \
  D:/MinGW-W64/ucrt64/include/openssl/buffererr.h \
  D:/MinGW-W64/ucrt64/include/sys/types.h \
- D:/MinGW-W64/ucrt64/include/openssl/ec.h \
- D:/MinGW-W64/ucrt64/include/openssl/ecerr.h \
  D:/MinGW-W64/ucrt64/include/openssl/dsa.h \
  D:/MinGW-W64/ucrt64/include/openssl/dh.h \
  D:/MinGW-W64/ucrt64/include/openssl/dherr.h \

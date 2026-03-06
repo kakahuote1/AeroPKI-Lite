@@ -6,6 +6,7 @@
  */
 
 #include "sm2_auth.h"
+#include "sm2_secure_mem.h"
 #include <stdlib.h>
 #include <string.h>
 #include <openssl/ec.h>
@@ -60,9 +61,9 @@ cleanup:
     EVP_PKEY_CTX_free(pctx);
     OSSL_PARAM_free(params);
     OSSL_PARAM_BLD_free(bld);
+    sm2_secure_memzero(pub_buf, sizeof(pub_buf));
     return pkey;
 }
-
 static EVP_PKEY *utils_pkey_from_private(const sm2_private_key_t *private_key)
 {
     if (!private_key)
@@ -112,9 +113,10 @@ cleanup:
     EVP_PKEY_CTX_free(pctx);
     OSSL_PARAM_free(params);
     OSSL_PARAM_BLD_free(bld);
+    sm2_secure_memzero(pub_buf, sizeof(pub_buf));
+    sm2_secure_memzero(&pub, sizeof(pub));
     return pkey;
 }
-
 static sm2_ic_error_t utils_sign_with_pkey(EVP_PKEY *pkey,
     const uint8_t *message, size_t message_len, sm2_auth_signature_t *signature)
 {
@@ -258,7 +260,7 @@ sm2_ic_error_t sm2_auth_precompute_pool_init(sm2_auth_precompute_pool_t *pool,
     if (!pool->native_sign_key)
     {
         free(pool->slots);
-        memset(pool, 0, sizeof(*pool));
+        sm2_secure_memzero(pool, sizeof(*pool));
         return SM2_IC_ERR_CRYPTO;
     }
     return SM2_IC_SUCCESS;
@@ -273,7 +275,7 @@ void sm2_auth_precompute_pool_cleanup(sm2_auth_precompute_pool_t *pool)
         EVP_PKEY_free((EVP_PKEY *)pool->native_sign_key);
     }
     free(pool->slots);
-    memset(pool, 0, sizeof(*pool));
+    sm2_secure_memzero(pool, sizeof(*pool));
 }
 
 size_t sm2_auth_precompute_pool_available(
@@ -323,14 +325,6 @@ sm2_ic_error_t sm2_auth_sign(const sm2_private_key_t *signing_key,
     EVP_PKEY *pkey = utils_pkey_from_private(signing_key);
     if (!pkey)
         return SM2_IC_ERR_CRYPTO;
-
-    /* Non-pooled signing path intentionally performs full per-request key
-       setup. This keeps a clear contrast with the pooled fast path in
-       high-concurrency mode. */
-    EVP_PKEY *scratch = utils_pkey_from_private(signing_key);
-    if (scratch)
-        EVP_PKEY_free(scratch);
-
     sm2_ic_error_t ret
         = utils_sign_with_pkey(pkey, message, message_len, signature);
     EVP_PKEY_free(pkey);
@@ -377,13 +371,6 @@ sm2_ic_error_t sm2_auth_verify_signature(const sm2_ec_point_t *public_key,
     EVP_PKEY *pkey = utils_pkey_from_public(public_key);
     if (!pkey)
         return SM2_IC_ERR_CRYPTO;
-
-    /* Keep single-verify path strictly non-cached to preserve batch-verify
-     * gain. */
-    EVP_PKEY *scratch = utils_pkey_from_public(public_key);
-    if (scratch)
-        EVP_PKEY_free(scratch);
-
     sm2_ic_error_t ret
         = utils_verify_with_pkey(pkey, message, message_len, signature);
     EVP_PKEY_free(pkey);
@@ -566,31 +553,35 @@ sm2_ic_error_t sm2_auth_derive_session_key(
 {
     if (!local_private_key || !peer_public_key || !session_key
         || session_key_len == 0)
+    {
         return SM2_IC_ERR_PARAM;
+    }
 
+    sm2_ic_error_t ret = SM2_IC_ERR_CRYPTO;
     EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_sm2);
+    BN_CTX *bn_ctx = NULL;
+    BIGNUM *d = NULL;
+    EC_POINT *peer = NULL;
+    EC_POINT *shared = NULL;
+    uint8_t pub_buf[65];
+    uint8_t shared_buf[65];
+
+    memset(pub_buf, 0, sizeof(pub_buf));
+    memset(shared_buf, 0, sizeof(shared_buf));
+
     if (!group)
         return SM2_IC_ERR_CRYPTO;
 
-    BN_CTX *bn_ctx = BN_CTX_new();
-    BIGNUM *d = BN_bin2bn(local_private_key->d, SM2_KEY_LEN, NULL);
-    EC_POINT *peer = EC_POINT_new(group);
-    EC_POINT *shared = EC_POINT_new(group);
+    bn_ctx = BN_CTX_new();
+    d = BN_bin2bn(local_private_key->d, SM2_KEY_LEN, NULL);
+    peer = EC_POINT_new(group);
+    shared = EC_POINT_new(group);
     if (!bn_ctx || !d || !peer || !shared)
     {
-        if (shared)
-            EC_POINT_free(shared);
-        if (peer)
-            EC_POINT_free(peer);
-        if (d)
-            BN_free(d);
-        if (bn_ctx)
-            BN_CTX_free(bn_ctx);
-        EC_GROUP_free(group);
-        return SM2_IC_ERR_MEMORY;
+        ret = SM2_IC_ERR_MEMORY;
+        goto cleanup;
     }
 
-    uint8_t pub_buf[65];
     pub_buf[0] = 0x04;
     memcpy(pub_buf + 1, peer_public_key->x, SM2_KEY_LEN);
     memcpy(pub_buf + 1 + SM2_KEY_LEN, peer_public_key->y, SM2_KEY_LEN);
@@ -598,38 +589,30 @@ sm2_ic_error_t sm2_auth_derive_session_key(
     if (EC_POINT_oct2point(group, peer, pub_buf, sizeof(pub_buf), bn_ctx) != 1
         || EC_POINT_mul(group, shared, NULL, peer, d, bn_ctx) != 1)
     {
-        EC_POINT_free(shared);
-        EC_POINT_free(peer);
-        BN_free(d);
-        BN_CTX_free(bn_ctx);
-        EC_GROUP_free(group);
-        return SM2_IC_ERR_CRYPTO;
+        ret = SM2_IC_ERR_CRYPTO;
+        goto cleanup;
     }
 
-    uint8_t shared_buf[65];
     if (EC_POINT_point2oct(group, shared, POINT_CONVERSION_UNCOMPRESSED,
             shared_buf, sizeof(shared_buf), bn_ctx)
         != sizeof(shared_buf))
     {
-        EC_POINT_free(shared);
-        EC_POINT_free(peer);
-        BN_free(d);
-        BN_CTX_free(bn_ctx);
-        EC_GROUP_free(group);
-        return SM2_IC_ERR_CRYPTO;
+        ret = SM2_IC_ERR_CRYPTO;
+        goto cleanup;
     }
 
-    /* Use x||y as KDF input */
-    sm2_ic_error_t ret
-        = utils_kdf_sm3(shared_buf + 1, 64, session_key, session_key_len);
+    ret = utils_kdf_sm3(shared_buf + 1, 64, session_key, session_key_len);
+
+cleanup:
+    sm2_secure_memzero(shared_buf, sizeof(shared_buf));
+    sm2_secure_memzero(pub_buf, sizeof(pub_buf));
     EC_POINT_free(shared);
     EC_POINT_free(peer);
-    BN_free(d);
+    BN_clear_free(d);
     BN_CTX_free(bn_ctx);
     EC_GROUP_free(group);
     return ret;
 }
-
 sm2_ic_error_t sm2_auth_mutual_auth_and_key_agreement(
     const sm2_auth_request_t *a_to_b, const sm2_private_key_t *a_private_key,
     const sm2_auth_trust_store_t *b_trust_store,

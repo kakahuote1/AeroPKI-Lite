@@ -15,6 +15,12 @@ CMakeFiles/sm2ecqv.dir/src/auth/auth.c.obj: \
  D:/MinGW-W64/ucrt64/lib/gcc/x86_64-w64-mingw32/15.1.0/include/stdbool.h \
  D:/cursor/workplace/AeroPKI-Lite/include/sm2_implicit_cert.h \
  D:/cursor/workplace/AeroPKI-Lite/include/sm2_revocation.h \
+ D:/cursor/workplace/AeroPKI-Lite/include/sm2_secure_mem.h \
+ D:/MinGW-W64/ucrt64/include/openssl/crypto.h \
+ D:/MinGW-W64/ucrt64/include/openssl/macros.h \
+ D:/MinGW-W64/ucrt64/include/openssl/opensslconf.h \
+ D:/MinGW-W64/ucrt64/include/openssl/configuration.h \
+ D:/MinGW-W64/ucrt64/include/openssl/opensslv.h \
  D:/MinGW-W64/ucrt64/include/stdlib.h \
  D:/MinGW-W64/ucrt64/include/corecrt_wstdlib.h \
  D:/MinGW-W64/ucrt64/lib/gcc/x86_64-w64-mingw32/15.1.0/include/limits.h \
@@ -23,39 +29,34 @@ CMakeFiles/sm2ecqv.dir/src/auth/auth.c.obj: \
  D:/MinGW-W64/ucrt64/include/sec_api/stdlib_s.h \
  D:/MinGW-W64/ucrt64/include/malloc.h \
  D:/MinGW-W64/ucrt64/lib/gcc/x86_64-w64-mingw32/15.1.0/include/mm_malloc.h \
- D:/MinGW-W64/ucrt64/include/errno.h D:/MinGW-W64/ucrt64/include/string.h \
- D:/MinGW-W64/ucrt64/include/sec_api/string_s.h \
- D:/MinGW-W64/ucrt64/include/openssl/ec.h \
- D:/MinGW-W64/ucrt64/include/openssl/macros.h \
- D:/MinGW-W64/ucrt64/include/openssl/opensslconf.h \
- D:/MinGW-W64/ucrt64/include/openssl/configuration.h \
- D:/MinGW-W64/ucrt64/include/openssl/opensslv.h \
- D:/MinGW-W64/ucrt64/include/openssl/types.h \
- D:/MinGW-W64/ucrt64/include/openssl/e_os2.h \
- D:/MinGW-W64/ucrt64/include/inttypes.h \
- D:/MinGW-W64/ucrt64/include/openssl/safestack.h \
- D:/MinGW-W64/ucrt64/include/openssl/stack.h \
- D:/MinGW-W64/ucrt64/include/stdio.h \
- D:/MinGW-W64/ucrt64/include/corecrt_stdio_config.h \
- D:/MinGW-W64/ucrt64/include/_mingw_off_t.h \
- D:/MinGW-W64/ucrt64/include/swprintf.inl \
- D:/MinGW-W64/ucrt64/include/sec_api/stdio_s.h \
- D:/MinGW-W64/ucrt64/include/openssl/asn1.h \
- D:/MinGW-W64/ucrt64/include/time.h \
+ D:/MinGW-W64/ucrt64/include/errno.h D:/MinGW-W64/ucrt64/include/time.h \
  D:/MinGW-W64/ucrt64/include/sys/timeb.h \
  D:/MinGW-W64/ucrt64/include/sec_api/sys/timeb_s.h \
  D:/MinGW-W64/ucrt64/include/_timeval.h \
  D:/MinGW-W64/ucrt64/include/pthread_time.h \
  D:/MinGW-W64/ucrt64/include/pthread_compat.h \
- D:/MinGW-W64/ucrt64/include/openssl/bio.h \
- D:/MinGW-W64/ucrt64/lib/gcc/x86_64-w64-mingw32/15.1.0/include/stdarg.h \
- D:/MinGW-W64/ucrt64/include/stdarg.h \
- D:/MinGW-W64/ucrt64/include/_mingw_stdarg.h \
- D:/MinGW-W64/ucrt64/include/openssl/crypto.h \
+ D:/MinGW-W64/ucrt64/include/openssl/e_os2.h \
+ D:/MinGW-W64/ucrt64/include/inttypes.h \
+ D:/MinGW-W64/ucrt64/include/stdio.h \
+ D:/MinGW-W64/ucrt64/include/corecrt_stdio_config.h \
+ D:/MinGW-W64/ucrt64/include/_mingw_off_t.h \
+ D:/MinGW-W64/ucrt64/include/swprintf.inl \
+ D:/MinGW-W64/ucrt64/include/sec_api/stdio_s.h \
+ D:/MinGW-W64/ucrt64/include/openssl/safestack.h \
+ D:/MinGW-W64/ucrt64/include/openssl/stack.h \
+ D:/MinGW-W64/ucrt64/include/openssl/types.h \
  D:/MinGW-W64/ucrt64/include/openssl/cryptoerr.h \
  D:/MinGW-W64/ucrt64/include/openssl/symhacks.h \
  D:/MinGW-W64/ucrt64/include/openssl/cryptoerr_legacy.h \
  D:/MinGW-W64/ucrt64/include/openssl/core.h \
+ D:/MinGW-W64/ucrt64/include/string.h \
+ D:/MinGW-W64/ucrt64/include/sec_api/string_s.h \
+ D:/MinGW-W64/ucrt64/include/openssl/ec.h \
+ D:/MinGW-W64/ucrt64/include/openssl/asn1.h \
+ D:/MinGW-W64/ucrt64/include/openssl/bio.h \
+ D:/MinGW-W64/ucrt64/lib/gcc/x86_64-w64-mingw32/15.1.0/include/stdarg.h \
+ D:/MinGW-W64/ucrt64/include/stdarg.h \
+ D:/MinGW-W64/ucrt64/include/_mingw_stdarg.h \
  D:/MinGW-W64/ucrt64/include/openssl/bioerr.h \
  D:/MinGW-W64/ucrt64/include/openssl/asn1err.h \
  D:/MinGW-W64/ucrt64/include/openssl/bn.h \

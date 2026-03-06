@@ -6,7 +6,11 @@
  */
 
 #include "sm2_pki_service.h"
+#include "sm2_secure_mem.h"
 #include <string.h>
+#include <openssl/bn.h>
+#include <openssl/ec.h>
+#include <openssl/obj_mac.h>
 
 static sm2_pki_identity_entry_t *service_find_identity(
     sm2_pki_service_ctx_t *ctx, const uint8_t *identity, size_t identity_len)
@@ -80,6 +84,61 @@ static sm2_ic_error_t service_ocsp_query(void *user_ctx, uint64_t serial_number,
     return SM2_IC_SUCCESS;
 }
 
+static bool service_private_key_in_valid_range(
+    const sm2_private_key_t *private_key)
+{
+    if (!private_key)
+        return false;
+
+    bool valid = false;
+    EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_sm2);
+    BIGNUM *order = BN_new();
+    BIGNUM *upper_bound = BN_new();
+    BIGNUM *d_bn = BN_bin2bn(private_key->d, SM2_KEY_LEN, NULL);
+
+    if (!group || !order || !upper_bound || !d_bn)
+        goto cleanup;
+    if (EC_GROUP_get_order(group, order, NULL) != 1)
+        goto cleanup;
+    if (BN_copy(upper_bound, order) == NULL)
+        goto cleanup;
+    if (!BN_sub_word(upper_bound, 2))
+        goto cleanup;
+
+    if (!BN_is_zero(d_bn) && !BN_is_negative(d_bn)
+        && BN_cmp(d_bn, upper_bound) <= 0)
+    {
+        valid = true;
+    }
+
+cleanup:
+    BN_clear_free(d_bn);
+    BN_free(upper_bound);
+    BN_free(order);
+    EC_GROUP_free(group);
+    return valid;
+}
+
+static sm2_pki_error_t service_generate_ca_private_key(
+    sm2_private_key_t *private_key)
+{
+    if (!private_key)
+        return SM2_PKI_ERR_PARAM;
+
+    for (size_t attempt = 0; attempt < 64; attempt++)
+    {
+        if (sm2_ic_generate_random(private_key->d, SM2_KEY_LEN)
+            != SM2_IC_SUCCESS)
+        {
+            return SM2_PKI_ERR_CRYPTO;
+        }
+        if (service_private_key_in_valid_range(private_key))
+            return SM2_PKI_SUCCESS;
+    }
+
+    sm2_secure_memzero(private_key->d, SM2_KEY_LEN);
+    return SM2_PKI_ERR_CRYPTO;
+}
 sm2_pki_error_t sm2_pki_service_init(sm2_pki_service_ctx_t *ctx,
     const uint8_t *issuer_id, size_t issuer_id_len,
     size_t expected_revoked_items, uint64_t filter_ttl_sec, uint64_t now_ts)
@@ -91,21 +150,27 @@ sm2_pki_error_t sm2_pki_service_init(sm2_pki_service_ctx_t *ctx,
     }
     memset(ctx, 0, sizeof(*ctx));
 
-    if (sm2_ic_generate_random(ctx->ca_private_key.d, SM2_KEY_LEN)
-        != SM2_IC_SUCCESS)
+    sm2_pki_error_t key_ret
+        = service_generate_ca_private_key(&ctx->ca_private_key);
+    if (key_ret != SM2_PKI_SUCCESS)
     {
-        return SM2_PKI_ERR_CRYPTO;
+        sm2_secure_memzero(ctx, sizeof(*ctx));
+        return key_ret;
     }
+
     if (sm2_ic_sm2_point_mult(
             &ctx->ca_public_key, ctx->ca_private_key.d, SM2_KEY_LEN, NULL)
         != SM2_IC_SUCCESS)
     {
+        sm2_secure_memzero(ctx, sizeof(*ctx));
         return SM2_PKI_ERR_CRYPTO;
     }
     if (sm2_revocation_init(
             &ctx->rev_ctx, expected_revoked_items, filter_ttl_sec, now_ts)
         != SM2_IC_SUCCESS)
     {
+        sm2_revocation_cleanup(&ctx->rev_ctx);
+        sm2_secure_memzero(ctx, sizeof(*ctx));
         return SM2_PKI_ERR_CRYPTO;
     }
 
@@ -115,13 +180,12 @@ sm2_pki_error_t sm2_pki_service_init(sm2_pki_service_ctx_t *ctx,
     ctx->initialized = true;
     return SM2_PKI_SUCCESS;
 }
-
 void sm2_pki_service_cleanup(sm2_pki_service_ctx_t *ctx)
 {
     if (!ctx)
         return;
     sm2_revocation_cleanup(&ctx->rev_ctx);
-    memset(ctx, 0, sizeof(*ctx));
+    sm2_secure_memzero(ctx, sizeof(*ctx));
 }
 
 sm2_pki_error_t sm2_pki_service_get_ca_public_key(

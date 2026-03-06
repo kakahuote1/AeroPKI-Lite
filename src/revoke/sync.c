@@ -24,6 +24,8 @@
 #define local_list_add sm2_rev_internal_local_list_add
 #define local_list_remove sm2_rev_internal_local_list_remove
 
+#define SM2_REV_SYNC_LOG_FLAG_REVOKED 0x01U
+
 static const sm2_rev_sync_log_entry_t *sync_log_get_const(
     const sm2_revocation_ctx_t *ctx, size_t logical_index)
 {
@@ -35,6 +37,54 @@ static const sm2_rev_sync_log_entry_t *sync_log_get_const(
     size_t physical
         = (ctx->sync_log_head + logical_index) % ctx->sync_log_capacity;
     return &ctx->sync_log[physical];
+}
+
+static sm2_rev_sync_log_entry_t *sync_log_get_mutable(
+    sm2_revocation_ctx_t *ctx, size_t logical_index)
+{
+    if (!ctx || !ctx->sync_log || logical_index >= ctx->sync_log_count
+        || ctx->sync_log_capacity == 0)
+    {
+        return NULL;
+    }
+    size_t physical
+        = (ctx->sync_log_head + logical_index) % ctx->sync_log_capacity;
+    return &ctx->sync_log[physical];
+}
+
+static bool sync_log_decode_new_version(const sm2_revocation_ctx_t *ctx,
+    const sm2_rev_sync_log_entry_t *entry, uint64_t *out_new_version)
+{
+    if (!ctx || !entry || !out_new_version)
+        return false;
+    if (ctx->sync_log_base_new_version
+        > UINT64_MAX - (uint64_t)entry->new_version_offset)
+    {
+        return false;
+    }
+    *out_new_version
+        = ctx->sync_log_base_new_version + (uint64_t)entry->new_version_offset;
+    return true;
+}
+
+static bool sync_log_decode_timestamp(const sm2_revocation_ctx_t *ctx,
+    const sm2_rev_sync_log_entry_t *entry, uint64_t *out_timestamp)
+{
+    if (!ctx || !entry || !out_timestamp)
+        return false;
+    if (ctx->sync_log_base_timestamp
+        > UINT64_MAX - (uint64_t)entry->timestamp_offset)
+    {
+        return false;
+    }
+    *out_timestamp
+        = ctx->sync_log_base_timestamp + (uint64_t)entry->timestamp_offset;
+    return true;
+}
+
+static bool sync_log_entry_revoked(const sm2_rev_sync_log_entry_t *entry)
+{
+    return entry && ((entry->flags & SM2_REV_SYNC_LOG_FLAG_REVOKED) != 0);
 }
 
 static sm2_ic_error_t sync_log_reserve_ordered(
@@ -60,6 +110,157 @@ static sm2_ic_error_t sync_log_reserve_ordered(
     ctx->sync_log_capacity = new_cap;
     ctx->sync_log_head = 0;
     return SM2_IC_SUCCESS;
+}
+
+static sm2_ic_error_t sync_log_rebase_to_oldest(sm2_revocation_ctx_t *ctx)
+{
+    if (!ctx)
+        return SM2_IC_ERR_PARAM;
+    if (ctx->sync_log_count == 0 || !ctx->sync_log)
+        return SM2_IC_SUCCESS;
+
+    const sm2_rev_sync_log_entry_t *oldest = sync_log_get_const(ctx, 0);
+    if (!oldest)
+        return SM2_IC_ERR_VERIFY;
+
+    uint64_t rebase_new = 0;
+    uint64_t rebase_ts = 0;
+    if (!sync_log_decode_new_version(ctx, oldest, &rebase_new)
+        || !sync_log_decode_timestamp(ctx, oldest, &rebase_ts))
+    {
+        return SM2_IC_ERR_VERIFY;
+    }
+
+    uint64_t old_base_new = ctx->sync_log_base_new_version;
+    uint64_t old_base_ts = ctx->sync_log_base_timestamp;
+
+    ctx->sync_log_base_new_version = rebase_new;
+    ctx->sync_log_base_timestamp = rebase_ts;
+
+    for (size_t i = 0; i < ctx->sync_log_count; i++)
+    {
+        sm2_rev_sync_log_entry_t *entry = sync_log_get_mutable(ctx, i);
+        if (!entry)
+            return SM2_IC_ERR_VERIFY;
+
+        if (old_base_new > UINT64_MAX - (uint64_t)entry->new_version_offset
+            || old_base_ts > UINT64_MAX - (uint64_t)entry->timestamp_offset)
+        {
+            return SM2_IC_ERR_VERIFY;
+        }
+
+        uint64_t abs_new = old_base_new + (uint64_t)entry->new_version_offset;
+        uint64_t abs_ts = old_base_ts + (uint64_t)entry->timestamp_offset;
+
+        if (abs_new < ctx->sync_log_base_new_version
+            || abs_ts < ctx->sync_log_base_timestamp)
+        {
+            return SM2_IC_ERR_VERIFY;
+        }
+
+        uint64_t v_off = abs_new - ctx->sync_log_base_new_version;
+        uint64_t ts_off = abs_ts - ctx->sync_log_base_timestamp;
+        if (v_off > UINT16_MAX || ts_off > UINT32_MAX)
+            return SM2_IC_ERR_VERIFY;
+
+        entry->new_version_offset = (uint16_t)v_off;
+        entry->timestamp_offset = (uint32_t)ts_off;
+    }
+
+    return SM2_IC_SUCCESS;
+}
+
+static void sync_log_drop_oldest(sm2_revocation_ctx_t *ctx)
+{
+    if (!ctx || ctx->sync_log_count == 0 || ctx->sync_log_capacity == 0)
+        return;
+
+    const sm2_rev_sync_log_entry_t *oldest = sync_log_get_const(ctx, 0);
+    uint64_t dropped_new = ctx->crl_version;
+    if (oldest)
+    {
+        if (!sync_log_decode_new_version(ctx, oldest, &dropped_new))
+            dropped_new = ctx->crl_version;
+    }
+
+    if (ctx->sync_log_oldest_base_version < dropped_new)
+        ctx->sync_log_oldest_base_version = dropped_new;
+
+    ctx->sync_log_head = (ctx->sync_log_head + 1) % ctx->sync_log_capacity;
+    ctx->sync_log_count--;
+
+    if (ctx->sync_log_count == 0)
+    {
+        ctx->sync_log_head = 0;
+        ctx->sync_log_base_new_version = 0;
+        ctx->sync_log_base_timestamp = 0;
+        ctx->sync_log_oldest_base_version = 0;
+    }
+}
+
+static bool sync_log_can_encode(
+    const sm2_revocation_ctx_t *ctx, uint64_t new_version, uint64_t now_ts)
+{
+    if (!ctx)
+        return false;
+    if (new_version < ctx->sync_log_base_new_version
+        || now_ts < ctx->sync_log_base_timestamp)
+    {
+        return false;
+    }
+
+    uint64_t v_off = new_version - ctx->sync_log_base_new_version;
+    uint64_t ts_off = now_ts - ctx->sync_log_base_timestamp;
+    return v_off <= UINT16_MAX && ts_off <= UINT32_MAX;
+}
+
+static sm2_ic_error_t sync_log_prepare_for_encode(sm2_revocation_ctx_t *ctx,
+    uint64_t base_version, uint64_t new_version, uint64_t now_ts)
+{
+    if (!ctx)
+        return SM2_IC_ERR_PARAM;
+
+    if (ctx->sync_log_count == 0)
+    {
+        ctx->sync_log_base_new_version = new_version;
+        ctx->sync_log_base_timestamp = now_ts;
+        ctx->sync_log_oldest_base_version = base_version;
+        return SM2_IC_SUCCESS;
+    }
+
+    if (sync_log_can_encode(ctx, new_version, now_ts))
+        return SM2_IC_SUCCESS;
+
+    while (ctx->sync_log_count > 0)
+    {
+        sm2_ic_error_t ret = sync_log_rebase_to_oldest(ctx);
+        if (ret != SM2_IC_SUCCESS)
+            return ret;
+
+        if (sync_log_can_encode(ctx, new_version, now_ts))
+            return SM2_IC_SUCCESS;
+
+        sync_log_drop_oldest(ctx);
+    }
+
+    ctx->sync_log_base_new_version = new_version;
+    ctx->sync_log_base_timestamp = now_ts;
+    ctx->sync_log_oldest_base_version = base_version;
+    return SM2_IC_SUCCESS;
+}
+
+static void sync_log_write_entry(sm2_revocation_ctx_t *ctx,
+    sm2_rev_sync_log_entry_t *dst, uint64_t new_version, uint64_t now_ts,
+    uint64_t serial_number, bool revoked)
+{
+    uint64_t v_off = new_version - ctx->sync_log_base_new_version;
+    uint64_t ts_off = now_ts - ctx->sync_log_base_timestamp;
+
+    dst->serial_number = serial_number;
+    dst->new_version_offset = (uint16_t)v_off;
+    dst->timestamp_offset = (uint32_t)ts_off;
+    dst->flags = revoked ? SM2_REV_SYNC_LOG_FLAG_REVOKED : 0;
+    dst->reserved = 0;
 }
 
 static sm2_ic_error_t sync_log_append(sm2_revocation_ctx_t *ctx,
@@ -93,27 +294,25 @@ static sm2_ic_error_t sync_log_append(sm2_revocation_ctx_t *ctx,
             return ret;
     }
 
-    size_t write_idx = 0;
-    if (ctx->sync_log_count < ctx->sync_log_window)
-    {
-        write_idx = (ctx->sync_log_head + ctx->sync_log_count)
-            % ctx->sync_log_capacity;
-        ctx->sync_log_count++;
-    }
-    else
-    {
-        write_idx = ctx->sync_log_head;
-        ctx->sync_log_head = (ctx->sync_log_head + 1) % ctx->sync_log_capacity;
-    }
+    if (ctx->sync_log_count >= ctx->sync_log_window)
+        sync_log_drop_oldest(ctx);
 
+    sm2_ic_error_t ret
+        = sync_log_prepare_for_encode(ctx, base_version, new_version, now_ts);
+    if (ret != SM2_IC_SUCCESS)
+        return ret;
+
+    if (ctx->sync_log_count >= ctx->sync_log_capacity)
+        return SM2_IC_ERR_MEMORY;
+
+    size_t write_idx
+        = (ctx->sync_log_head + ctx->sync_log_count) % ctx->sync_log_capacity;
     sm2_rev_sync_log_entry_t *dst = &ctx->sync_log[write_idx];
-    dst->base_version = base_version;
-    dst->new_version = new_version;
-    dst->timestamp = now_ts;
-    dst->serial_number = serial_number;
-    dst->revoked = revoked;
+    sync_log_write_entry(ctx, dst, new_version, now_ts, serial_number, revoked);
+    ctx->sync_log_count++;
     return SM2_IC_SUCCESS;
 }
+
 static bool sync_log_has_base(
     const sm2_revocation_ctx_t *ctx, uint64_t base_version)
 {
@@ -124,11 +323,11 @@ static bool sync_log_has_base(
     if (ctx->sync_log_count == 0)
         return false;
 
-    const sm2_rev_sync_log_entry_t *earliest = sync_log_get_const(ctx, 0);
-    if (!earliest)
-        return false;
-    return base_version >= earliest->base_version
-        && base_version <= ctx->crl_version;
+    uint64_t oldest_base = ctx->sync_log_oldest_base_version;
+    if (oldest_base > ctx->crl_version)
+        oldest_base = ctx->crl_version;
+
+    return base_version >= oldest_base && base_version <= ctx->crl_version;
 }
 static sm2_ic_error_t sync_reset_local_state(
     sm2_revocation_ctx_t *ctx, uint64_t now_ts)
@@ -140,6 +339,9 @@ static sm2_ic_error_t sync_reset_local_state(
     ctx->crl_version = 0;
     ctx->sync_log_count = 0;
     ctx->sync_log_head = 0;
+    ctx->sync_log_base_new_version = 0;
+    ctx->sync_log_base_timestamp = 0;
+    ctx->sync_log_oldest_base_version = 0;
 
     size_t bucket_count = ctx->filter.bucket_count;
     if (bucket_count < 64)
@@ -350,7 +552,11 @@ static sm2_ic_error_t sync_collect_items_from_log(
     for (size_t i = 0; i < ctx->sync_log_count; i++)
     {
         const sm2_rev_sync_log_entry_t *entry = sync_log_get_const(ctx, i);
-        if (entry && entry->new_version > from_version)
+        uint64_t entry_new = 0;
+        if (!entry || !sync_log_decode_new_version(ctx, entry, &entry_new))
+            return SM2_IC_ERR_VERIFY;
+
+        if (entry_new > from_version)
         {
             start = i;
             break;
@@ -366,10 +572,11 @@ static sm2_ic_error_t sync_collect_items_from_log(
     while (end < ctx->sync_log_count)
     {
         const sm2_rev_sync_log_entry_t *entry = sync_log_get_const(ctx, end);
-        if (!entry)
-            break;
+        uint64_t entry_new = 0;
+        if (!entry || !sync_log_decode_new_version(ctx, entry, &entry_new))
+            return SM2_IC_ERR_VERIFY;
 
-        if (entry->new_version <= from_version)
+        if (entry_new <= from_version)
         {
             end++;
             continue;
@@ -378,12 +585,12 @@ static sm2_ic_error_t sync_collect_items_from_log(
         if (raw_count < max_items)
         {
             raw_count++;
-            window_to_version = entry->new_version;
+            window_to_version = entry_new;
             end++;
             continue;
         }
 
-        if (entry->new_version == window_to_version)
+        if (entry_new == window_to_version)
         {
             raw_count++;
             end++;
@@ -399,7 +606,11 @@ static sm2_ic_error_t sync_collect_items_from_log(
     for (size_t i = end; i < ctx->sync_log_count; i++)
     {
         const sm2_rev_sync_log_entry_t *entry = sync_log_get_const(ctx, i);
-        if (entry && entry->new_version > window_to_version)
+        uint64_t entry_new = 0;
+        if (!entry || !sync_log_decode_new_version(ctx, entry, &entry_new))
+            return SM2_IC_ERR_VERIFY;
+
+        if (entry_new > window_to_version)
         {
             *has_more = true;
             break;
@@ -418,9 +629,19 @@ static sm2_ic_error_t sync_collect_items_from_log(
     for (size_t i = start; i < end; i++)
     {
         const sm2_rev_sync_log_entry_t *entry = sync_log_get_const(ctx, i);
-        if (!entry || entry->new_version <= from_version)
+        uint64_t entry_new = 0;
+        uint64_t entry_ts = 0;
+        if (!entry || !sync_log_decode_new_version(ctx, entry, &entry_new)
+            || !sync_log_decode_timestamp(ctx, entry, &entry_ts))
+        {
+            free(merged);
+            return SM2_IC_ERR_VERIFY;
+        }
+
+        if (entry_new <= from_version)
             continue;
 
+        bool entry_revoked = sync_log_entry_revoked(entry);
         size_t hit = merged_n;
         for (size_t j = 0; j < merged_n; j++)
         {
@@ -434,28 +655,27 @@ static sm2_ic_error_t sync_collect_items_from_log(
         if (hit == merged_n)
         {
             merged[merged_n].serial_number = entry->serial_number;
-            merged[merged_n].revoked = entry->revoked;
-            merged[merged_n].version = entry->new_version;
-            merged[merged_n].timestamp = entry->timestamp;
+            merged[merged_n].revoked = entry_revoked;
+            merged[merged_n].version = entry_new;
+            merged[merged_n].timestamp = entry_ts;
             merged_n++;
             continue;
         }
 
         sync_delta_merge_item_t *m = &merged[hit];
-        if (entry->new_version > m->version)
+        if (entry_new > m->version)
         {
-            m->version = entry->new_version;
-            m->timestamp = entry->timestamp;
-            m->revoked = entry->revoked;
+            m->version = entry_new;
+            m->timestamp = entry_ts;
+            m->revoked = entry_revoked;
         }
-        else if (entry->new_version == m->version
-            && entry->timestamp > m->timestamp)
+        else if (entry_new == m->version && entry_ts > m->timestamp)
         {
-            m->timestamp = entry->timestamp;
-            m->revoked = entry->revoked;
+            m->timestamp = entry_ts;
+            m->revoked = entry_revoked;
         }
 
-        if (entry->revoked || m->revoked)
+        if (entry_revoked || m->revoked)
             m->revoked = true;
     }
 
@@ -702,7 +922,12 @@ sm2_ic_error_t sm2_revocation_sync_plan(const sm2_revocation_ctx_t *ctx,
             {
                 const sm2_rev_sync_log_entry_t *entry
                     = sync_log_get_const(ctx, i);
-                if (entry->new_version > plan->from_version)
+                uint64_t entry_new = 0;
+                if (!entry
+                    || !sync_log_decode_new_version(ctx, entry, &entry_new))
+                    return SM2_IC_ERR_VERIFY;
+
+                if (entry_new > plan->from_version)
                 {
                     sync_mark_candidates_from_serial(
                         ctx, entry->serial_number, plan);
@@ -735,7 +960,11 @@ sm2_ic_error_t sm2_revocation_sync_plan(const sm2_revocation_ctx_t *ctx,
         for (size_t i = 0; i < ctx->sync_log_count; i++)
         {
             const sm2_rev_sync_log_entry_t *entry = sync_log_get_const(ctx, i);
-            if (entry->new_version > plan->from_version)
+            uint64_t entry_new = 0;
+            if (!entry || !sync_log_decode_new_version(ctx, entry, &entry_new))
+                return SM2_IC_ERR_VERIFY;
+
+            if (entry_new > plan->from_version)
             {
                 sync_mark_candidates_from_serial(
                     ctx, entry->serial_number, plan);

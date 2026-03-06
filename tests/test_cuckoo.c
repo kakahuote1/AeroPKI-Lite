@@ -1,6 +1,7 @@
 ﻿/* SPDX-License-Identifier: Apache-2.0 */
 
 #include "test_common.h"
+#include <limits.h>
 
 static void test_revocation_delta_and_cuckoo()
 {
@@ -184,10 +185,26 @@ static void test_revocation_false_positive_rate_constrained()
     TEST_PASS();
 }
 
+static void test_revocation_filter_config_overflow_guard()
+{
+    sm2_revocation_ctx_t ctx;
+    TEST_ASSERT(sm2_revocation_init(&ctx, 64, 300, 100) == SM2_IC_SUCCESS,
+        "Revocation Init");
+
+    size_t huge_bucket_size = (SIZE_MAX / 64U) + 1U;
+    TEST_ASSERT(
+        sm2_revocation_config_local_filter(&ctx, 16, huge_bucket_size, 500)
+            == SM2_IC_ERR_PARAM,
+        "Filter Config Overflow Guard");
+
+    sm2_revocation_cleanup(&ctx);
+    TEST_PASS();
+}
 void run_test_cuckoo_suite(void)
 {
     RUN_TEST(test_revocation_delta_and_cuckoo);
     RUN_TEST(test_revocation_ttl_expire);
     RUN_TEST(test_revocation_false_positive_rate);
     RUN_TEST(test_revocation_false_positive_rate_constrained);
+    RUN_TEST(test_revocation_filter_config_overflow_guard);
 }

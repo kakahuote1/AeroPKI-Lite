@@ -103,11 +103,11 @@ extern "C"
 
     typedef struct
     {
-        uint64_t base_version;
-        uint64_t new_version;
-        uint64_t timestamp;
         uint64_t serial_number;
-        bool revoked;
+        uint32_t timestamp_offset;
+        uint16_t new_version_offset;
+        uint8_t flags;
+        uint8_t reserved;
     } sm2_rev_sync_log_entry_t;
 
     typedef struct
@@ -200,6 +200,9 @@ extern "C"
         uint64_t sync_epoch;
         uint64_t last_sync_ts;
         uint64_t last_sync_nonce;
+        uint64_t sync_log_base_new_version;
+        uint64_t sync_log_base_timestamp; /* Seconds epoch base. */
+        uint64_t sync_log_oldest_base_version;
         uint8_t filter_param_hash[SM2_REV_SYNC_DIGEST_LEN];
 
         sm2_rev_sync_log_entry_t *sync_log;

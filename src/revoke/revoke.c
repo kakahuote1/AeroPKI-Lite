@@ -6,6 +6,7 @@
  */
 
 #include "revoke_internal.h"
+#include "sm2_secure_mem.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -19,30 +20,65 @@
 #define rebuild_filter sm2_rev_internal_rebuild_filter
 #define sync_log_append sm2_rev_internal_sync_log_append
 
-static sm2_ic_error_t local_list_add(sm2_revocation_ctx_t *ctx, uint64_t serial)
+static sm2_ic_error_t local_list_reserve(
+    sm2_revocation_ctx_t *ctx, size_t target_count)
 {
-    for (size_t i = 0; i < ctx->revoked_count; i++)
+    if (!ctx)
+        return SM2_IC_ERR_PARAM;
+    if (target_count <= ctx->revoked_capacity)
+        return SM2_IC_SUCCESS;
+
+    size_t new_cap = (ctx->revoked_capacity == 0) ? 64 : ctx->revoked_capacity;
+    while (new_cap < target_count)
     {
-        if (ctx->revoked_serials[i] == serial)
-            return SM2_IC_SUCCESS;
+        if (new_cap > (SIZE_MAX / 2))
+            return SM2_IC_ERR_MEMORY;
+        new_cap *= 2;
+    }
+    if (new_cap > (SIZE_MAX / sizeof(uint64_t)))
+        return SM2_IC_ERR_MEMORY;
+
+    uint64_t *new_mem = (uint64_t *)malloc(new_cap * sizeof(uint64_t));
+    if (!new_mem)
+        return SM2_IC_ERR_MEMORY;
+
+    if (ctx->revoked_serials)
+    {
+        if (ctx->revoked_count > 0)
+        {
+            memcpy(new_mem, ctx->revoked_serials,
+                ctx->revoked_count * sizeof(uint64_t));
+        }
+        sm2_secure_memzero(
+            ctx->revoked_serials, ctx->revoked_capacity * sizeof(uint64_t));
+        free(ctx->revoked_serials);
     }
 
-    if (ctx->revoked_count == ctx->revoked_capacity)
+    ctx->revoked_serials = new_mem;
+    ctx->revoked_capacity = new_cap;
+    return SM2_IC_SUCCESS;
+}
+static sm2_ic_error_t local_list_add(sm2_revocation_ctx_t *ctx, uint64_t serial)
+{
+    if (!ctx)
+        return SM2_IC_ERR_PARAM;
+
+    if (cuckoo_contains(&ctx->filter, serial))
     {
-        size_t new_cap
-            = ctx->revoked_capacity == 0 ? 64 : ctx->revoked_capacity * 2;
-        uint64_t *new_mem = (uint64_t *)realloc(
-            ctx->revoked_serials, new_cap * sizeof(uint64_t));
-        if (!new_mem)
-            return SM2_IC_ERR_MEMORY;
-        ctx->revoked_serials = new_mem;
-        ctx->revoked_capacity = new_cap;
+        for (size_t i = 0; i < ctx->revoked_count; i++)
+        {
+            if (ctx->revoked_serials[i] == serial)
+                return SM2_IC_SUCCESS;
+        }
     }
+
+    sm2_ic_error_t ret = local_list_reserve(ctx, ctx->revoked_count + 1);
+    if (ret != SM2_IC_SUCCESS)
+        return ret;
 
     ctx->revoked_serials[ctx->revoked_count++] = serial;
     return SM2_IC_SUCCESS;
 }
-
 static void local_list_remove(sm2_revocation_ctx_t *ctx, uint64_t serial)
 {
     for (size_t i = 0; i < ctx->revoked_count; i++)
@@ -85,14 +121,20 @@ static sm2_ocsp_cache_entry_t *cache_find(
 
 static sm2_ocsp_cache_entry_t *cache_pick_slot(sm2_revocation_ctx_t *ctx)
 {
+    if (!ctx || !ctx->ocsp_cache || ctx->ocsp_cache_capacity == 0)
+        return NULL;
+
+    sm2_ocsp_cache_entry_t *victim = &ctx->ocsp_cache[0];
     for (size_t i = 0; i < ctx->ocsp_cache_capacity; i++)
     {
-        if (!ctx->ocsp_cache[i].used)
-            return &ctx->ocsp_cache[i];
+        sm2_ocsp_cache_entry_t *entry = &ctx->ocsp_cache[i];
+        if (!entry->used)
+            return entry;
+        if (!victim->used || entry->expires_at < victim->expires_at)
+            victim = entry;
     }
-    return &ctx->ocsp_cache[0];
+    return victim;
 }
-
 static void cache_put(sm2_revocation_ctx_t *ctx, uint64_t serial,
     sm2_rev_status_t status, uint64_t expires_at)
 {
@@ -146,13 +188,35 @@ void sm2_revocation_cleanup(sm2_revocation_ctx_t *ctx)
 {
     if (!ctx)
         return;
+
+    if (ctx->filter.fingerprints)
+    {
+        sm2_secure_memzero(ctx->filter.fingerprints,
+            ctx->filter.bucket_count * ctx->filter.bucket_size
+                * sizeof(uint32_t));
+    }
+    if (ctx->revoked_serials && ctx->revoked_capacity > 0)
+    {
+        sm2_secure_memzero(
+            ctx->revoked_serials, ctx->revoked_capacity * sizeof(uint64_t));
+    }
+    if (ctx->ocsp_cache && ctx->ocsp_cache_capacity > 0)
+    {
+        sm2_secure_memzero(ctx->ocsp_cache,
+            ctx->ocsp_cache_capacity * sizeof(sm2_ocsp_cache_entry_t));
+    }
+    if (ctx->sync_log && ctx->sync_log_capacity > 0)
+    {
+        sm2_secure_memzero(ctx->sync_log,
+            ctx->sync_log_capacity * sizeof(sm2_rev_sync_log_entry_t));
+    }
+
     free(ctx->filter.fingerprints);
     free(ctx->revoked_serials);
     free(ctx->ocsp_cache);
     free(ctx->sync_log);
-    memset(ctx, 0, sizeof(*ctx));
+    sm2_secure_memzero(ctx, sizeof(*ctx));
 }
-
 sm2_ic_error_t sm2_revocation_set_online(
     sm2_revocation_ctx_t *ctx, bool online_mode)
 {
@@ -171,6 +235,11 @@ sm2_ic_error_t sm2_revocation_config_ocsp(
     ctx->ocsp_cfg = *cfg;
     if (ctx->ocsp_cfg.cache_capacity == 0)
     {
+        if (ctx->ocsp_cache && ctx->ocsp_cache_capacity > 0)
+        {
+            sm2_secure_memzero(ctx->ocsp_cache,
+                ctx->ocsp_cache_capacity * sizeof(sm2_ocsp_cache_entry_t));
+        }
         free(ctx->ocsp_cache);
         ctx->ocsp_cache = NULL;
         ctx->ocsp_cache_capacity = 0;
@@ -182,12 +251,16 @@ sm2_ic_error_t sm2_revocation_config_ocsp(
     if (!new_cache)
         return SM2_IC_ERR_MEMORY;
 
+    if (ctx->ocsp_cache && ctx->ocsp_cache_capacity > 0)
+    {
+        sm2_secure_memzero(ctx->ocsp_cache,
+            ctx->ocsp_cache_capacity * sizeof(sm2_ocsp_cache_entry_t));
+    }
     free(ctx->ocsp_cache);
     ctx->ocsp_cache = new_cache;
     ctx->ocsp_cache_capacity = cfg->cache_capacity;
     return SM2_IC_SUCCESS;
 }
-
 sm2_ic_error_t sm2_revocation_config_local_filter(sm2_revocation_ctx_t *ctx,
     uint8_t fp_bits, size_t bucket_size, size_t max_kicks)
 {
