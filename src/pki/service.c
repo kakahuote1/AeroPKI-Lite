@@ -1,4 +1,4 @@
-﻿/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-License-Identifier: Apache-2.0 */
 
 /**
  * @file sm2_pki_service.c
@@ -6,6 +6,7 @@
  */
 
 #include "sm2_pki_service.h"
+#include "sm2_auth.h"
 #include "sm2_secure_mem.h"
 #include <string.h>
 #include <openssl/bn.h>
@@ -60,30 +61,113 @@ static sm2_pki_identity_entry_t *service_alloc_identity(
     return NULL;
 }
 
-static sm2_ic_error_t service_ocsp_query(void *user_ctx, uint64_t serial_number,
-    uint32_t timeout_ms, sm2_ocsp_response_t *response)
+static sm2_ic_error_t service_merkle_sign_cb(void *user_ctx,
+    const uint8_t *data, size_t data_len, uint8_t *signature,
+    size_t *signature_len)
 {
-    (void)timeout_ms;
-    sm2_pki_service_ctx_t *ctx = (sm2_pki_service_ctx_t *)user_ctx;
-    if (!ctx || !response)
+    if (!user_ctx || !data || !signature || !signature_len)
         return SM2_IC_ERR_PARAM;
 
-    sm2_pki_identity_entry_t *entry
-        = service_find_by_serial(ctx, serial_number);
-    response->serial_number = serial_number;
-    response->this_update = 0;
-    response->next_update = UINT64_MAX;
+    sm2_pki_service_ctx_t *ctx = (sm2_pki_service_ctx_t *)user_ctx;
+    sm2_auth_signature_t sig;
+    sm2_ic_error_t ret
+        = sm2_auth_sign(&ctx->ca_private_key, data, data_len, &sig);
+    if (ret != SM2_IC_SUCCESS)
+        return ret;
 
-    if (!entry)
-    {
-        response->status = SM2_REV_STATUS_UNKNOWN;
-        return SM2_IC_SUCCESS;
-    }
-    response->status
-        = entry->revoked ? SM2_REV_STATUS_REVOKED : SM2_REV_STATUS_GOOD;
+    if (*signature_len < sig.der_len)
+        return SM2_IC_ERR_MEMORY;
+
+    memcpy(signature, sig.der, sig.der_len);
+    *signature_len = sig.der_len;
     return SM2_IC_SUCCESS;
 }
 
+static sm2_ic_error_t service_merkle_verify_cb(void *user_ctx,
+    const uint8_t *data, size_t data_len, const uint8_t *signature,
+    size_t signature_len)
+{
+    if (!user_ctx || !data || !signature || signature_len == 0
+        || signature_len > SM2_AUTH_MAX_SIG_DER_LEN)
+    {
+        return SM2_IC_ERR_PARAM;
+    }
+
+    sm2_pki_service_ctx_t *ctx = (sm2_pki_service_ctx_t *)user_ctx;
+    sm2_auth_signature_t sig;
+    memset(&sig, 0, sizeof(sig));
+    memcpy(sig.der, signature, signature_len);
+    sig.der_len = signature_len;
+
+    return sm2_auth_verify_signature(&ctx->ca_public_key, data, data_len, &sig);
+}
+
+static sm2_ic_error_t service_merkle_query(const sm2_implicit_cert_t *cert,
+    uint64_t now_ts, void *user_ctx, sm2_rev_status_t *status)
+{
+    if (!cert || !user_ctx || !status)
+        return SM2_IC_ERR_PARAM;
+
+    sm2_pki_service_ctx_t *ctx = (sm2_pki_service_ctx_t *)user_ctx;
+    sm2_rev_merkle_tree_t tree;
+    sm2_rev_merkle_root_record_t root_record;
+    sm2_rev_merkle_membership_proof_t member_proof;
+    sm2_rev_merkle_non_membership_proof_t non_member_proof;
+    memset(&tree, 0, sizeof(tree));
+    memset(&root_record, 0, sizeof(root_record));
+    memset(&member_proof, 0, sizeof(member_proof));
+    memset(&non_member_proof, 0, sizeof(non_member_proof));
+
+    uint64_t root_version
+        = ctx->rev_ctx.crl_version == 0 ? 1 : ctx->rev_ctx.crl_version;
+    sm2_ic_error_t ret = sm2_revocation_merkle_build(&tree,
+        ctx->rev_ctx.revoked_serials, ctx->rev_ctx.revoked_count, root_version);
+    if (ret != SM2_IC_SUCCESS)
+        return ret;
+
+    uint64_t ttl = ctx->rev_ctx.root_valid_ttl_sec;
+    if (ttl == 0)
+        ttl = 300;
+    uint64_t valid_from = now_ts > ttl ? now_ts - ttl : 0;
+    uint64_t valid_until = now_ts;
+    if (ttl <= UINT64_MAX - valid_until)
+        valid_until += ttl;
+    else
+        valid_until = UINT64_MAX;
+
+    ret = sm2_revocation_merkle_sign_root(&tree, valid_from, valid_until,
+        service_merkle_sign_cb, ctx, &root_record);
+    if (ret != SM2_IC_SUCCESS)
+        goto cleanup;
+
+    ret = sm2_revocation_merkle_prove_member(
+        &tree, cert->serial_number, &member_proof);
+    if (ret == SM2_IC_SUCCESS)
+    {
+        ret = sm2_revocation_merkle_verify_member_with_root(
+            &root_record, now_ts, &member_proof, service_merkle_verify_cb, ctx);
+        if (ret == SM2_IC_SUCCESS)
+            *status = SM2_REV_STATUS_REVOKED;
+        goto cleanup;
+    }
+
+    if (ret != SM2_IC_ERR_VERIFY)
+        goto cleanup;
+
+    ret = sm2_revocation_merkle_prove_non_member(
+        &tree, cert->serial_number, &non_member_proof);
+    if (ret != SM2_IC_SUCCESS)
+        goto cleanup;
+
+    ret = sm2_revocation_merkle_verify_non_member_with_root(
+        &root_record, now_ts, &non_member_proof, service_merkle_verify_cb, ctx);
+    if (ret == SM2_IC_SUCCESS)
+        *status = SM2_REV_STATUS_GOOD;
+
+cleanup:
+    sm2_revocation_merkle_cleanup(&tree);
+    return ret;
+}
 static bool service_private_key_in_valid_range(
     const sm2_private_key_t *private_key)
 {
@@ -167,6 +251,15 @@ sm2_pki_error_t sm2_pki_service_init(sm2_pki_service_ctx_t *ctx,
     }
     if (sm2_revocation_init(
             &ctx->rev_ctx, expected_revoked_items, filter_ttl_sec, now_ts)
+        != SM2_IC_SUCCESS)
+    {
+        sm2_revocation_cleanup(&ctx->rev_ctx);
+        sm2_secure_memzero(ctx, sizeof(*ctx));
+        return SM2_PKI_ERR_CRYPTO;
+    }
+
+    if (sm2_revocation_set_merkle_query(
+            &ctx->rev_ctx, service_merkle_query, ctx)
         != SM2_IC_SUCCESS)
     {
         sm2_revocation_cleanup(&ctx->rev_ctx);
@@ -307,19 +400,4 @@ sm2_pki_error_t sm2_pki_revoke_check(sm2_pki_service_ctx_t *ctx,
         return SM2_PKI_ERR_PARAM;
     return sm2_pki_error_from_ic(sm2_revocation_query(
         &ctx->rev_ctx, serial_number, now_ts, status, source));
-}
-
-sm2_pki_error_t sm2_pki_service_build_ocsp_cfg(sm2_pki_service_ctx_t *ctx,
-    uint32_t timeout_ms, uint8_t retry_count, size_t cache_capacity,
-    sm2_ocsp_client_cfg_t *cfg)
-{
-    if (!ctx || !cfg || !ctx->initialized)
-        return SM2_PKI_ERR_PARAM;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->query_fn = service_ocsp_query;
-    cfg->user_ctx = ctx;
-    cfg->timeout_ms = timeout_ms;
-    cfg->retry_count = retry_count;
-    cfg->cache_capacity = cache_capacity;
-    return SM2_PKI_SUCCESS;
 }

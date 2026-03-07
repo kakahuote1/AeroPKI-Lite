@@ -3,121 +3,106 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Language](https://img.shields.io/badge/Language-C11-orange.svg)]()
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg)]()
+[![Build](https://img.shields.io/badge/Build-CMake-brightgreen.svg)]()
 
 <p align="center">
-  <span style="font-size:18px">
-    <b>AeroPKI-Lite</b> 是一个纯 C11 语言编写的 PKI 协议栈，底层依赖 OpenSSL 3.0 EVP 接口，深度融合了 <b>ECQV 隐式证书</b> 与 <b>国密商用密码算法（SM2/SM3/SM4）</b>。
+  <img src="https://img.shields.io/badge/AeroPKI-Lite-black?style=for-the-badge&logo=c&logoColor=white" alt="AeroPKI-Lite Logo">
+  <br>
+  <span style="font-size:16px">
+    <b>AeroPKI-Lite</b> 是一个纯 C11 实现的极轻量级、高安全的公钥基础设施（PKI）原型系统。基于 OpenSSL 3.0 EVP 接口与完整的国密算法套件（SM2/SM3/SM4），专为<b>航空（无人机自组网）</b>与<b>极度资源受限的物联网 (IoT)</b> 场景设计。
   </span>
 </p>
 
-## 📖 项目背景与核心设计
-
-针对航空链路环境中普遍面临的**终端资源受限**、**信号链路不稳定**、以及**核心节点高并发压力**三大原生约束，本项目给出了一套从底层算法到系统工程化的全链路解答：
-
-- 🪶 **轻证书 (应对资源受限)**
-  基于 ECQV 将公钥与签名过程在数学上融合，结合自定义 CBOR 紧凑编码与位掩码字段裁剪机制。在极限配置下，隐式证书序列化体积仅为 `67 Bytes`（相较于传统 X.509 降低近 90%），极大地降低了电台传输成本。
-
-- 🛡️ **稳撤销 (应对链路不稳定 & 长周期断网)**
-  支持常态在线 OCSP 缓存查询，并在网络受限时降级至离线模式（近似 `O(1)` 的布谷鸟过滤器极速匹配）。系统独创 **离线空中同步 (Cuckoo Sync)** 机制，允许断网环境下的无人机集群在空中相遇时，仅通过微量哈希桶摘要交换即可导出差异包（Delta），利用 O(1) 环形写入实现撤销黑名单的快速“传染”与双向收敛。
-
-- ⚡ **快认证 (应对高并发压力)**
-  为突破高频短连接性能瓶颈，底层引入**预计算池**（静默填充签名素材复用上下文均摊开销）和**批量并行验签**引擎，高层应用域封装由 SM2 隐式双向认证无缝衔接至 SM4 会话防护的一体化逻辑链。
-
-- 🏗️ **高工程标准**
-  全量逻辑紧密托管于独立的上下文对象体系以确保多线安全，并深度适配 CMake/CTest 标准构建流与核心用例全覆盖。
-
 ---
 
-## 📂 当前目录结构
+## 🌟 核心理念与亮点
+
+传统 X.509 PKI 体系在由于证书体积庞大、撤销列表查询开销高，往往难以在嵌入式系统或窄带无线电环境中落地。AeroPKI-Lite 通过以下两大核心技术彻底重构了设备认证链路：
+
+**1. 极轻量隐式证书 (ECQV)**
+- 摒弃了传统的 X.509 DER 编码，采用 Elliptic Curve Qu-Vanstone (ECQV) 隐式证书模型。
+- 结合极简的 CBOR 二进制序列化，单张设备的身份证书被极限压缩至 **~67 字节**（相较于标准 X.509 缩小约 90%）。
+
+**2. Merkle 累加器与零存储撤销**
+- **设备端零存储**：轻量节点无需在本地维护任何状态，只需凭借一个由 CA 签名的 32 字节根哈希即可开始验证。
+- **可验证查询证明**：当节点查询证书撤销状态时，服务端返回具备密码学防伪造的 Merkle Proof（Membership / Non-membership）。设备自行验真，节点无法欺骗。
+- **k-匿名隐私保护**：设备发起的查询会被 SM3-PRNG 安全洗牌，混入 k-1 个诱饵序列号，确保服务端无法分析出设备的真实交互轨迹。
+- **大并发压缩增强**：首创 Multi-Proof 结构压缩算法，支持批量混淆查询时的哈希分支去重，节省最高 70% 的下行带宽。
+
+## 📂 架构与目录结构
+
+整个库采用严格的模块化 C11 开发，零第三方逻辑混入，内存安全与生命周期边界清晰：
 
 ```text
 AeroPKI-Lite/
-├── include/
-│   ├── sm2_*.h                 # 兼容层公共 API
-│   └── sm2ecqv/                # 命名空间化公共 API
+├── include/                   # 核心公开 API 头文件
+│   └── sm2ecqv/               # 对外暴露的业务逻辑接口
 ├── src/
-│   ├── ecqv/                   # ECQV + CBOR
-│   ├── revoke/                 # 撤销管理
-│   │   ├── cuckoo.c            # 布谷鸟过滤器引擎
-│   │   ├── revoke.c            # OCSP/CRL/查询状态机
-│   │   ├── sync.c              # 离线同步协议
-│   │   └── revoke_internal.h   # 模块内部共享声明
-│   ├── auth/                   # 认证、预计算、批量验签、会话保护
-│   ├── pki/                    # CA/RA 服务端与客户端封装
-│   └── app/
-│       ├── main.c
-│       ├── demo_test_cert_flow.c  # 演示测试1：证书链路
-│       └── demo_test_sync_flow.c  # 演示测试2：离线同步链路
-├── tests/
-│   ├── test_cuckoo.c
-│   ├── test_revoke.c
-│   ├── test_sync.c
-│   ├── test_ecqv.c
-│   ├── test_auth.c
-│   ├── test_pki.c
-│   └── test_main.c
-├── CMakeLists.txt
-└── Makefile
+│   ├── ecqv/                  # ECQV 隐式证书签发与从构建引擎
+│   ├── revoke/                # 【核心】Merkle 树累加器与撤销证明引擎
+│   │   ├── merkle.c           # Merkle 树构建、成员/非成员证明生成与验证
+│   │   ├── merkle_cbor.c      # 面向网络传输的 CBOR 紧凑编解码实现
+│   │   ├── merkle_epoch.c     # Epoch 目录切分、热补丁 (Hot Patch) 与分层缓存
+│   │   ├── merkle_k_anon.c    # k-匿名混淆查询、风险评估、PRNG 策略
+│   │   └── revoke.c           # 高吞吐 P2P 信任评估矩阵、路由调配与共识
+│   ├── auth/                  # 证书认证、预计算并发验证、SM4 AEAD 会话协商
+│   ├── pki/                   # CA 签发服务端逻辑与终端 Client 状态机
+│   └── app/                   # 使用 AeroPKI-Lite 库编写的演示入口
+├── tests/                     # 覆盖超过 75+ 用例的全量 CTest 套件 (含负面/边界测试)
+├── CMakeLists.txt             # 现代 CMake 跨平台构建脚本
+└── Makefile                   # 通用快捷构建包装
 ```
 
 ---
 
-## 🚀 构建与回归
+## 🚀 快速开始与构建
 
-### 🛠️ 环境依赖
+### 环境要求
+- 兼容 C11 标准的编译器（`gcc` / `clang` / `msvc` / 集成环境自带 `MinGW-w64` 等）
+- `CMake >= 3.14`
+- `OpenSSL >= 3.0` (推荐配置于系统路径或手工指定 `OPENSSL_ROOT_DIR`)
 
-- 🧰 **C11 编译器** (GCC / Clang / MSVC)
-- ⚙️ **CMake** (>= 3.14)
-- 🔒 **OpenSSL** (>= 3.0，链接 `libcrypto` 与 `libssl`)
-
-### 📦 推荐编译流程
+### 一键构建命令 (以 Windows/MinGW 为例)
 
 ```bash
-cmake -S . -B build_local -DCMAKE_BUILD_TYPE=Release
-cmake --build build_local -j 1
+# 生成 Ninja 或 MinGW Makefile 工程 (可依据本地环境更改 -G 参数)
+cmake -S . -B build_local -DCMAKE_BUILD_TYPE=Release -G "MinGW Makefiles"
+
+# 并发编译整个项目
+cmake --build build_local -j 4
+
+# 执行 CTest 集成测试框架
 ctest --test-dir build_local --output-on-failure
-```
 
-### ✅ 全量验证入口
-
-集成所有模块单元与集成用例，确保回归安全。
-
-```bash
+# 或者直接运行包含聚合测试结果的可执行文件
 ./build_local/test_all.exe
 ```
 
 ---
 
-## 💻 完整编程演示程序
+## README 演示测试（可直接运行）
 
-为了快速上手业务流，我们在 `src/app/` 下提供了可独立编译与运行的 Demo 程序。
+### 演示 1：证书签发 -> 认证验签 -> 吊销拦截
+文件：`src/app/demo_test_cert_flow.c`
 
-### 📜 核心流：证书签发 -> 验签 -> 吊销拦截
+展示能力：
+1. 服务端注册身份并签发隐式证书。
+2. 客户端导入证书并完成签名验签。
+3. 服务端吊销后，验证链路被正确阻断。
 
-**功能覆盖**:
-  1. 服务端初始化、身份注册、证书请求与签发。
-  2. 客户端导入隐式证书并重构自身合法公私钥对。
-  3. 利用重构私钥执行签名与验签（吊销前应通过）。
-  4. 模拟服务端吊销后终端再次验证（链路应彻底被阻断）。
-
-运行命令：
-
+运行：
 ```bash
 cmake --build build_local --target sm2_test_cert_flow -j 1
 ./build_local/sm2_test_cert_flow.exe
 ```
 
-预期输出（示意）：
-
+示例输出：
 ```text
 [OK]   Service Init
 [OK]   Identity Register
 [OK]   Cert Request
 [OK]   Cert Issue
-[OK]   Get CA Public Key
 [OK]   Client Init
-[OK]   Import Cert
-[OK]   Sign Message
 [OK]   Verify Before Revoke
 [OK]   Revoke Cert
 [OK]   Revoke Check
@@ -125,66 +110,45 @@ cmake --build build_local --target sm2_test_cert_flow -j 1
 [PASS] demo_test_cert_flow
 ```
 
-### 📡 断网相遇同步
+### 演示 2：Merkle 证明 + Multi-Proof 压缩 + k-匿名风险
+文件：`src/app/demo_test_merkle_flow.c`
 
-**功能覆盖**:
-  1. 初始化双节点 A 与 B 的撤销上下文并装载同步身份标识。
-  2. A 节点本地执行增量撤销记录。
-  3. B 节点相遇发送 `hello` 广播。
-  4. A 根据自身清单与 `hello` 计算同步计划并导出带签名的差异包（Delta Packet）。
-  5. B 严格校验完整性与签名后，应用数据包，与 A 实现版本对齐。
-  6. B 对同步后的故障序列号发起本地查询，结果确认为阻断状态（`revoked`）。
+展示能力：
+1. 构建 Merkle 累加器并验证 member/non-member 证明。
+2. 将 k-匿名查询打包为 Multi-Proof 并验证。
+3. 输出单证明总字节与 Multi-Proof 字节，量化带宽压缩收益。
+4. 输出 k-匿名风险评分与跨度指标。
 
-运行命令：
-
+运行：
 ```bash
-cmake --build build_local --target sm2_test_sync_flow -j 1
-./build_local/sm2_test_sync_flow.exe
+cmake --build build_local --target sm2_test_merkle_flow -j 1
+./build_local/sm2_test_merkle_flow.exe
 ```
 
-预期输出（示意）：
-
+示例输出：
 ```text
-[OK]   Init Node A
-[OK]   Init Node B
-[OK]   Set Sync Identity A
-[OK]   Set Sync Identity B
-[OK]   Apply Delta On A
-[OK]   B Hello
-[OK]   A Plan For B
-[OK]   Export Delta Packet
-[OK]   Apply Delta Packet On B
-[OK]   Query Serial 880001 On B
-[OK]   Query Serial 880002 On B
-[PASS] demo_test_sync_flow
+[OK]   Build Merkle Tree
+[OK]   Verify Member Proof
+[OK]   Verify Non-Member Proof
+[OK]   Build K-Anon Query
+[OK]   Verify Multi-Proof
+[METRIC] single_total=xxxx bytes, multiproof=xxxx bytes, reduction=xx.xx%
+[METRIC] k=16, real_index=x, span=xxx, risk=0.xxxxxx
+[PASS] demo_test_merkle_flow
 ```
 
-> **💡 注意**：该演示为了快速剥离周边依赖环境，使用了被精简的“最小签名/验签回调函数”以此保证核心协议层的接口调用路径完整无缺。生产环境实际部署时，请替换挂载为真实 SM2 原生签名验签外壳。
+## English Summary
+AeroPKI-Lite is a C11 lightweight PKI prototype based on OpenSSL EVP.
 
----
+Current revocation path is Merkle-only, featuring:
+- verifiable membership/non-membership proofs,
+- multiproof bandwidth reduction,
+- k-anonymity query packaging.
 
-## 🤝 开源与参与贡献
-
-- 📜 **许可证**: `Apache-2.0`（详见 [LICENSE](LICENSE)）
-- 👥 **贡献规范**: 提交 PR 前请务必阅读并遵守 [CONTRIBUTING.md](CONTRIBUTING.md) 以了解架构约束与 C11 编码缩进约定。
-- 📝 **演进记录**: 核心 API 的增加或重构逻辑与解释，请追踪查阅 [CHANGELOG.md](CHANGELOG.md)。
-
----
-
-## 🌎 English Summary
-
-AeroPKI-Lite is a C11 PKI prototype for constrained aviation networks.
-It combines ECQV implicit certificates with SM2/SM3/SM4, and provides:
-
-- compact certificate encoding and key reconstruction,
-- hybrid revocation (`OCSP + incremental CRL + Cuckoo Filter`),
-- offline encounter sync (Cuckoo Sync),
-- high-throughput auth via precompute pool and batch verify.
-
-Quick build and test:
-
+Quick start:
 ```bash
 cmake -S . -B build_local -DCMAKE_BUILD_TYPE=Release
 cmake --build build_local -j 1
 ctest --test-dir build_local --output-on-failure
+./build_local/test_all.exe
 ```

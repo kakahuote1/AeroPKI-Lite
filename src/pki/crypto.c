@@ -68,3 +68,24 @@ sm2_pki_error_t sm2_pki_sm4_decrypt(const uint8_t key[16], const uint8_t iv[16],
     return sm2_pki_error_from_ic(sm2_auth_sm4_decrypt(
         key, iv, ciphertext, ciphertext_len, plaintext, plaintext_len));
 }
+
+sm2_pki_error_t sm2_pki_sm4_aead_encrypt(sm2_pki_aead_mode_t mode,
+    const uint8_t key[16], const uint8_t *iv, size_t iv_len, const uint8_t *aad,
+    size_t aad_len, const uint8_t *plaintext, size_t plaintext_len,
+    uint8_t *ciphertext, size_t *ciphertext_len, uint8_t *tag, size_t *tag_len)
+{
+    return sm2_pki_error_from_ic(sm2_auth_sm4_aead_encrypt(mode, key, iv,
+        iv_len, aad, aad_len, plaintext, plaintext_len, ciphertext,
+        ciphertext_len, tag, tag_len));
+}
+
+sm2_pki_error_t sm2_pki_sm4_aead_decrypt(sm2_pki_aead_mode_t mode,
+    const uint8_t key[16], const uint8_t *iv, size_t iv_len, const uint8_t *aad,
+    size_t aad_len, const uint8_t *ciphertext, size_t ciphertext_len,
+    const uint8_t *tag, size_t tag_len, uint8_t *plaintext,
+    size_t *plaintext_len)
+{
+    return sm2_pki_error_from_ic(sm2_auth_sm4_aead_decrypt(mode, key, iv,
+        iv_len, aad, aad_len, ciphertext, ciphertext_len, tag, tag_len,
+        plaintext, plaintext_len));
+}

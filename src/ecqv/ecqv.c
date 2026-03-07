@@ -40,6 +40,43 @@ static EC_GROUP *utils_get_sm2_group()
     return EC_GROUP_new_by_curve_name(NID_sm2);
 }
 
+static sm2_ic_error_t utils_generate_serial(uint64_t *serial_out)
+{
+    if (!serial_out)
+        return SM2_IC_ERR_PARAM;
+
+    uint8_t rnd[sizeof(uint64_t)] = { 0 };
+    if (RAND_bytes(rnd, sizeof(rnd)) != 1)
+        return SM2_IC_ERR_CRYPTO;
+
+    uint64_t serial = 0;
+    for (size_t i = 0; i < sizeof(rnd); i++)
+    {
+        serial = (serial << 8) | rnd[i];
+    }
+    if (serial == 0)
+        serial = 1;
+    *serial_out = serial;
+    return SM2_IC_SUCCESS;
+}
+
+static sm2_ic_error_t utils_rand_scalar_nonzero(
+    BIGNUM *out, const BIGNUM *order)
+{
+    if (!out || !order)
+        return SM2_IC_ERR_PARAM;
+
+    for (int i = 0; i < 64; i++)
+    {
+        if (BN_rand_range(out, order) != 1)
+            return SM2_IC_ERR_CRYPTO;
+        if (!BN_is_zero(out))
+            return SM2_IC_SUCCESS;
+    }
+
+    return SM2_IC_ERR_CRYPTO;
+}
+
 static int utils_valid_field_mask(uint16_t field_mask)
 {
     return (field_mask & (uint16_t)(~SM2_IC_FIELD_MASK_ALL)) == 0;
@@ -92,7 +129,10 @@ static sm2_ic_error_t utils_calc_cert_hash(const sm2_implicit_cert_t *cert,
         return SM2_IC_ERR_CRYPTO;
 
     /* 3. Convert to Integer (mod n) */
-    BN_bin2bn(hash_buf, SM3_DIGEST_LENGTH, h_bn);
+    if (!BN_bin2bn(hash_buf, SM3_DIGEST_LENGTH, h_bn))
+    {
+        return SM2_IC_ERR_CRYPTO;
+    }
     if (!BN_nnmod(h_bn, h_bn, order, ctx))
     {
         return SM2_IC_ERR_CRYPTO;
@@ -106,6 +146,10 @@ static sm2_ic_error_t utils_calc_cert_hash(const sm2_implicit_cert_t *cert,
 
 sm2_ic_error_t sm2_ic_generate_random(uint8_t *buf, size_t len)
 {
+    if (!buf && len > 0)
+        return SM2_IC_ERR_PARAM;
+    if (len == 0)
+        return SM2_IC_SUCCESS;
     /* Note: For production embedded systems, replace with HAL_TRNG driver. */
     if (RAND_bytes(buf, len) != 1)
     {
@@ -117,6 +161,9 @@ sm2_ic_error_t sm2_ic_generate_random(uint8_t *buf, size_t len)
 sm2_ic_error_t sm2_ic_sm3_hash(
     const uint8_t *input, size_t input_len, uint8_t *output)
 {
+    if (!output || (!input && input_len > 0))
+        return SM2_IC_ERR_PARAM;
+
     unsigned int len = SM3_DIGEST_LENGTH;
     EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
     if (!mdctx)
@@ -137,52 +184,77 @@ sm2_ic_error_t sm2_ic_sm3_hash(
 sm2_ic_error_t sm2_ic_sm2_point_mult(sm2_ec_point_t *point,
     const uint8_t *scalar, size_t scalar_len, const sm2_ec_point_t *base_point)
 {
-    if (!point || !scalar)
+    if (!point || !scalar || scalar_len == 0)
         return SM2_IC_ERR_PARAM;
 
     EC_GROUP *group = utils_get_sm2_group();
     BN_CTX *ctx = BN_CTX_new();
     BIGNUM *k = utils_bin_to_bn(scalar, scalar_len);
-    EC_POINT *R = EC_POINT_new(group);
-    int res = SM2_IC_ERR_CRYPTO;
+    EC_POINT *R = NULL;
+    EC_POINT *P = NULL;
+    sm2_ic_error_t ret = SM2_IC_ERR_CRYPTO;
 
-    /* Perform Scalar Multiplication: R = k * G (if base_point is NULL) or R = k
+    if (!group || !ctx || !k)
+    {
+        ret = SM2_IC_ERR_MEMORY;
+        goto clean_up;
+    }
+
+    R = EC_POINT_new(group);
+    if (!R)
+    {
+        ret = SM2_IC_ERR_MEMORY;
+        goto clean_up;
+    }
+
+    /* Perform Scalar Multiplication: R = k * G (if base_point is NULL) or R =
+     * k
      */
     /* * P */
     if (base_point == NULL)
     {
-        if (EC_POINT_mul(group, R, k, NULL, NULL, ctx) == 1)
-            res = SM2_IC_SUCCESS;
+        if (EC_POINT_mul(group, R, k, NULL, NULL, ctx) != 1)
+            goto clean_up;
     }
     else
     {
-        EC_POINT *P = EC_POINT_new(group);
+        P = EC_POINT_new(group);
+        if (!P)
+        {
+            ret = SM2_IC_ERR_MEMORY;
+            goto clean_up;
+        }
+
         uint8_t buf[65];
         buf[0] = 0x04; /* Uncompressed */
         memcpy(buf + 1, base_point->x, 32);
         memcpy(buf + 33, base_point->y, 32);
-        if (EC_POINT_oct2point(group, P, buf, 65, ctx) == 1)
-        {
-            if (EC_POINT_mul(group, R, NULL, P, k, ctx) == 1)
-                res = SM2_IC_SUCCESS;
-        }
-        EC_POINT_free(P);
+        if (EC_POINT_oct2point(group, P, buf, 65, ctx) != 1)
+            goto clean_up;
+        if (EC_POINT_mul(group, R, NULL, P, k, ctx) != 1)
+            goto clean_up;
     }
 
-    if (res == SM2_IC_SUCCESS)
     {
         uint8_t point_buf[65];
-        EC_POINT_point2oct(
-            group, R, POINT_CONVERSION_UNCOMPRESSED, point_buf, 65, ctx);
+        if (EC_POINT_point2oct(group, R, POINT_CONVERSION_UNCOMPRESSED,
+                point_buf, sizeof(point_buf), ctx)
+            != sizeof(point_buf))
+        {
+            goto clean_up;
+        }
         memcpy(point->x, point_buf + 1, 32);
         memcpy(point->y, point_buf + 33, 32);
+        ret = SM2_IC_SUCCESS;
     }
 
-    BN_free(k);
+clean_up:
+    BN_clear_free(k);
+    EC_POINT_free(P);
     EC_POINT_free(R);
     EC_GROUP_free(group);
     BN_CTX_free(ctx);
-    return res;
+    return ret;
 }
 
 void sm2_ic_issue_ctx_init(sm2_ic_issue_ctx_t *ctx)
@@ -223,35 +295,60 @@ sm2_ic_error_t sm2_ic_create_cert_request(sm2_ic_cert_request_t *request,
     if (subject_id_len > sizeof(request->subject_id))
         return SM2_IC_ERR_PARAM;
 
+    memset(request, 0, sizeof(*request));
+
     EC_GROUP *group = utils_get_sm2_group();
     BN_CTX *ctx = BN_CTX_new();
 
     /* Generate Ephemeral Keypair (k, R_U) */
     BIGNUM *x = BN_new();
-    const BIGNUM *order = EC_GROUP_get0_order(group);
-    BN_rand_range(x, order);
+    const BIGNUM *order = group ? EC_GROUP_get0_order(group) : NULL;
+    EC_POINT *X = NULL;
+    sm2_ic_error_t ret = SM2_IC_ERR_CRYPTO;
 
-    EC_POINT *X = EC_POINT_new(group);
-    EC_POINT_mul(group, X, x, NULL, NULL, ctx);
+    if (!group || !ctx || !x || !order)
+    {
+        ret = SM2_IC_ERR_MEMORY;
+        goto clean_up;
+    }
+
+    X = EC_POINT_new(group);
+    if (!X)
+    {
+        ret = SM2_IC_ERR_MEMORY;
+        goto clean_up;
+    }
+
+    if (utils_rand_scalar_nonzero(x, order) != SM2_IC_SUCCESS)
+        goto clean_up;
+
+    if (EC_POINT_mul(group, X, x, NULL, NULL, ctx) != 1)
+        goto clean_up;
 
     /* Export Results */
     utils_bn_to_bin(x, temp_private_key->d, 32);
 
     uint8_t point_buf[65];
-    EC_POINT_point2oct(
-        group, X, POINT_CONVERSION_UNCOMPRESSED, point_buf, 65, ctx);
+    if (EC_POINT_point2oct(group, X, POINT_CONVERSION_UNCOMPRESSED, point_buf,
+            sizeof(point_buf), ctx)
+        != sizeof(point_buf))
+    {
+        goto clean_up;
+    }
     memcpy(request->temp_public_key.x, point_buf + 1, 32);
     memcpy(request->temp_public_key.y, point_buf + 33, 32);
 
     memcpy(request->subject_id, subject_id, subject_id_len);
     request->subject_id_len = subject_id_len;
     request->key_usage = key_usage;
+    ret = SM2_IC_SUCCESS;
 
-    BN_free(x);
+clean_up:
+    BN_clear_free(x);
     EC_POINT_free(X);
     EC_GROUP_free(group);
     BN_CTX_free(ctx);
-    return SM2_IC_SUCCESS;
+    return ret;
 }
 
 sm2_ic_error_t sm2_ic_ca_generate_cert_with_ctx(sm2_ic_cert_result_t *result,
@@ -273,17 +370,30 @@ sm2_ic_error_t sm2_ic_ca_generate_cert_with_ctx(sm2_ic_cert_result_t *result,
 
     EC_GROUP *group = utils_get_sm2_group();
     BN_CTX *ctx = BN_CTX_new();
-    const BIGNUM *order = EC_GROUP_get0_order(group);
+    const BIGNUM *order = group ? EC_GROUP_get0_order(group) : NULL;
+    uint64_t serial = 0;
+    time_t now_ts = 0;
 
     BIGNUM *k = BN_new();
     BIGNUM *d_ca = utils_bin_to_bn(ca_private_key->d, 32);
-    EC_POINT *X = EC_POINT_new(group);
-    EC_POINT *V = EC_POINT_new(group);
+    EC_POINT *X = group ? EC_POINT_new(group) : NULL;
+    EC_POINT *V = group ? EC_POINT_new(group) : NULL;
     BIGNUM *h = BN_new();
     BIGNUM *s = BN_new();
-    EC_POINT *kG = EC_POINT_new(group);
+    EC_POINT *kG = group ? EC_POINT_new(group) : NULL;
     BIGNUM *tmp = BN_new();
     sm2_ic_error_t ret = SM2_IC_ERR_CRYPTO;
+
+    if (!group || !ctx || !order || !k || !d_ca || !X || !V || !h || !s || !kG
+        || !tmp)
+    {
+        ret = SM2_IC_ERR_MEMORY;
+        goto clean_up;
+    }
+
+    now_ts = time(NULL);
+    if (now_ts < 0)
+        goto clean_up;
 
     /* Import Ephemeral Key X */
     uint8_t point_buf[65];
@@ -294,16 +404,23 @@ sm2_ic_error_t sm2_ic_ca_generate_cert_with_ctx(sm2_ic_cert_result_t *result,
         goto clean_up;
 
     /* 1. Calculate Public Reconstruction Key: V = X + k*G */
-    BN_rand_range(k, order);
-    EC_POINT_mul(group, kG, k, NULL, NULL, ctx);
-    EC_POINT_add(group, V, X, kG, ctx);
+    if (utils_rand_scalar_nonzero(k, order) != SM2_IC_SUCCESS)
+        goto clean_up;
+    if (EC_POINT_mul(group, kG, k, NULL, NULL, ctx) != 1)
+        goto clean_up;
+    if (EC_POINT_add(group, V, X, kG, ctx) != 1)
+        goto clean_up;
 
     /* 2. Fill Certificate Metadata (fields controlled by global field mask */
     /* template) */
     const uint16_t mask
         = issue_ctx ? issue_ctx->field_mask : SM2_IC_FIELD_MASK_ALL;
+    ret = utils_generate_serial(&serial);
+    if (ret != SM2_IC_SUCCESS)
+        goto clean_up;
+
     result->cert.type = SM2_CERT_TYPE_IMPLICIT;
-    result->cert.serial_number = (uint64_t)time(NULL);
+    result->cert.serial_number = serial;
     result->cert.field_mask = mask;
 
     if (utils_field_enabled(mask, SM2_IC_FIELD_SUBJECT_ID))
@@ -329,7 +446,7 @@ sm2_ic_error_t sm2_ic_ca_generate_cert_with_ctx(sm2_ic_cert_result_t *result,
 
     if (utils_field_enabled(mask, SM2_IC_FIELD_VALID_FROM))
     {
-        result->cert.valid_from = (uint64_t)time(NULL);
+        result->cert.valid_from = (uint64_t)now_ts;
     }
     else
     {
@@ -365,24 +482,29 @@ sm2_ic_error_t sm2_ic_ca_generate_cert_with_ctx(sm2_ic_cert_result_t *result,
     /* 4. Calculate Hash: h = SM3(CBOR(Cert)) */
     if ((ret = utils_calc_cert_hash(&result->cert, h, order, ctx))
         != SM2_IC_SUCCESS)
+    {
         goto clean_up;
+    }
 
     /* 5. Compute Private Reconstruction Data: s = (h * k + d_CA) mod n */
-    BN_mod_mul(tmp, h, k, order, ctx);
-    BN_mod_add(s, tmp, d_ca, order, ctx);
+    if (BN_mod_mul(tmp, h, k, order, ctx) != 1)
+        goto clean_up;
+    if (BN_mod_add(s, tmp, d_ca, order, ctx) != 1)
+        goto clean_up;
+
     utils_bn_to_bin(s, result->private_recon_value, 32);
     ret = SM2_IC_SUCCESS;
 
 clean_up:
     EC_GROUP_free(group);
     BN_CTX_free(ctx);
-    BN_free(k);
-    BN_free(d_ca);
+    BN_clear_free(k);
+    BN_clear_free(d_ca);
     EC_POINT_free(X);
     EC_POINT_free(V);
     BN_free(h);
-    BN_free(s);
-    BN_free(tmp);
+    BN_clear_free(s);
+    BN_clear_free(tmp);
     EC_POINT_free(kG);
     return ret;
 }
@@ -403,18 +525,27 @@ sm2_ic_error_t sm2_ic_reconstruct_keys(sm2_private_key_t *private_key,
     const sm2_private_key_t *temp_private_key,
     const sm2_ec_point_t *ca_public_key)
 {
+    if (!private_key || !public_key || !cert_result || !temp_private_key)
+        return SM2_IC_ERR_PARAM;
+
     (void)ca_public_key;
     EC_GROUP *group = utils_get_sm2_group();
     BN_CTX *ctx = BN_CTX_new();
-    const BIGNUM *order = EC_GROUP_get0_order(group);
+    const BIGNUM *order = group ? EC_GROUP_get0_order(group) : NULL;
 
     BIGNUM *x = utils_bin_to_bn(temp_private_key->d, 32);
     BIGNUM *s = utils_bin_to_bn(cert_result->private_recon_value, 32);
     BIGNUM *h = BN_new();
     BIGNUM *d_u = BN_new();
     BIGNUM *tmp = BN_new();
-    EC_POINT *Q = EC_POINT_new(group);
+    EC_POINT *Q = group ? EC_POINT_new(group) : NULL;
     sm2_ic_error_t ret = SM2_IC_ERR_CRYPTO;
+
+    if (!group || !ctx || !order || !x || !s || !h || !d_u || !tmp || !Q)
+    {
+        ret = SM2_IC_ERR_MEMORY;
+        goto clean_up;
+    }
 
     /* 1. Calculate Hash h */
     if ((ret = utils_calc_cert_hash(&cert_result->cert, h, order, ctx))
@@ -422,16 +553,24 @@ sm2_ic_error_t sm2_ic_reconstruct_keys(sm2_private_key_t *private_key,
         goto clean_up;
 
     /* 2. Recover User Private Key: d_U = (h * x + s) mod n */
-    BN_mod_mul(tmp, h, x, order, ctx);
-    BN_mod_add(d_u, tmp, s, order, ctx);
+    if (BN_mod_mul(tmp, h, x, order, ctx) != 1)
+        goto clean_up;
+    if (BN_mod_add(d_u, tmp, s, order, ctx) != 1)
+        goto clean_up;
+
     utils_bn_to_bin(d_u, private_key->d, 32);
 
     /* 3. Derived User Public Key: Q_U = d_U * G */
-    EC_POINT_mul(group, Q, d_u, NULL, NULL, ctx);
+    if (EC_POINT_mul(group, Q, d_u, NULL, NULL, ctx) != 1)
+        goto clean_up;
 
     uint8_t point_buf[65];
-    EC_POINT_point2oct(
-        group, Q, POINT_CONVERSION_UNCOMPRESSED, point_buf, 65, ctx);
+    if (EC_POINT_point2oct(group, Q, POINT_CONVERSION_UNCOMPRESSED, point_buf,
+            sizeof(point_buf), ctx)
+        != sizeof(point_buf))
+    {
+        goto clean_up;
+    }
     memcpy(public_key->x, point_buf + 1, 32);
     memcpy(public_key->y, point_buf + 33, 32);
     ret = SM2_IC_SUCCESS;
@@ -439,11 +578,11 @@ sm2_ic_error_t sm2_ic_reconstruct_keys(sm2_private_key_t *private_key,
 clean_up:
     EC_GROUP_free(group);
     BN_CTX_free(ctx);
-    BN_free(x);
-    BN_free(s);
+    BN_clear_free(x);
+    BN_clear_free(s);
     BN_free(h);
-    BN_free(d_u);
-    BN_free(tmp);
+    BN_clear_free(d_u);
+    BN_clear_free(tmp);
     EC_POINT_free(Q);
     return ret;
 }
@@ -451,28 +590,39 @@ clean_up:
 sm2_ic_error_t sm2_ic_verify_cert(const sm2_implicit_cert_t *cert,
     const sm2_ec_point_t *public_key, const sm2_ec_point_t *ca_public_key)
 {
+    if (!cert || !public_key || !ca_public_key)
+        return SM2_IC_ERR_PARAM;
+
     EC_GROUP *group = utils_get_sm2_group();
     BN_CTX *ctx = BN_CTX_new();
-    const BIGNUM *order = EC_GROUP_get0_order(group);
+    const BIGNUM *order = group ? EC_GROUP_get0_order(group) : NULL;
 
     BIGNUM *h = BN_new();
-    EC_POINT *Q_U = EC_POINT_new(group);
-    EC_POINT *P_CA = EC_POINT_new(group);
-    EC_POINT *V = EC_POINT_new(group);
-    EC_POINT *Calc_Q = EC_POINT_new(group);
-    EC_POINT *hV = EC_POINT_new(group);
-    sm2_ic_error_t ret = SM2_IC_ERR_PARAM;
+    EC_POINT *Q_U = group ? EC_POINT_new(group) : NULL;
+    EC_POINT *P_CA = group ? EC_POINT_new(group) : NULL;
+    EC_POINT *V = group ? EC_POINT_new(group) : NULL;
+    EC_POINT *Calc_Q = group ? EC_POINT_new(group) : NULL;
+    EC_POINT *hV = group ? EC_POINT_new(group) : NULL;
+    sm2_ic_error_t ret = SM2_IC_ERR_CRYPTO;
+
+    if (!group || !ctx || !order || !h || !Q_U || !P_CA || !V || !Calc_Q || !hV)
+    {
+        ret = SM2_IC_ERR_MEMORY;
+        goto clean_up;
+    }
 
     /* Helper: Point Conversion */
     uint8_t buf[65];
     buf[0] = 0x04;
     memcpy(buf + 1, public_key->x, 32);
     memcpy(buf + 33, public_key->y, 32);
-    EC_POINT_oct2point(group, Q_U, buf, 65, ctx);
+    if (EC_POINT_oct2point(group, Q_U, buf, 65, ctx) != 1)
+        goto clean_up;
 
     memcpy(buf + 1, ca_public_key->x, 32);
     memcpy(buf + 33, ca_public_key->y, 32);
-    EC_POINT_oct2point(group, P_CA, buf, 65, ctx);
+    if (EC_POINT_oct2point(group, P_CA, buf, 65, ctx) != 1)
+        goto clean_up;
 
     /* Decompress V */
     if (!EC_POINT_oct2point(
@@ -484,8 +634,10 @@ sm2_ic_error_t sm2_ic_verify_cert(const sm2_implicit_cert_t *cert,
         goto clean_up;
 
     /* 2. Verify: Q_U == h * V + P_CA */
-    EC_POINT_mul(group, hV, NULL, V, h, ctx);
-    EC_POINT_add(group, Calc_Q, hV, P_CA, ctx);
+    if (EC_POINT_mul(group, hV, NULL, V, h, ctx) != 1)
+        goto clean_up;
+    if (EC_POINT_add(group, Calc_Q, hV, P_CA, ctx) != 1)
+        goto clean_up;
 
     ret = (EC_POINT_cmp(group, Q_U, Calc_Q, ctx) == 0) ? SM2_IC_SUCCESS
                                                        : SM2_IC_ERR_VERIFY;
@@ -796,6 +948,8 @@ sm2_ic_error_t sm2_ic_cbor_decode_cert(
     {
         if (utils_cbor_read_head(input, input_len, &offset, 0, &val)
             != SM2_IC_SUCCESS)
+            return SM2_IC_ERR_CBOR;
+        if (val > UINT8_MAX)
             return SM2_IC_ERR_CBOR;
         cert->key_usage = (uint8_t)val;
     }

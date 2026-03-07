@@ -30,6 +30,8 @@ extern "C"
 
         sm2_auth_trust_store_t trust_store;
         sm2_revocation_ctx_t *rev_ctx;
+        sm2_auth_revocation_query_fn revocation_query_fn;
+        void *revocation_query_user_ctx;
 
         sm2_auth_precompute_pool_t precompute_pool;
         bool precompute_enabled;
@@ -43,6 +45,10 @@ extern "C"
 
     sm2_pki_error_t sm2_pki_client_add_trusted_ca(
         sm2_pki_client_ctx_t *ctx, const sm2_ec_point_t *ca_public_key);
+
+    sm2_pki_error_t sm2_pki_client_set_revocation_query(
+        sm2_pki_client_ctx_t *ctx, sm2_auth_revocation_query_fn query_fn,
+        void *user_ctx);
 
     sm2_pki_error_t sm2_pki_client_import_cert(sm2_pki_client_ctx_t *ctx,
         const sm2_ic_cert_result_t *cert_result,

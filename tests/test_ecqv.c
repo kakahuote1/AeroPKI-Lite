@@ -63,6 +63,11 @@ void test_setup_ca()
             == SM2_IC_SUCCESS,
         "CA PubKey Failed");
     g_ca_initialized = 1;
+}
+
+static void test_setup_ca_case()
+{
+    test_setup_ca();
     TEST_PASS();
 }
 
@@ -200,6 +205,30 @@ static void test_cbor_robustness()
             sm2_ic_cbor_decode_cert(&out, oversize, o) == SM2_IC_ERR_CBOR,
             "Oversize Subject Must Fail");
     }
+
+    TEST_PASS();
+}
+
+static void test_cbor_key_usage_overflow_rejected()
+{
+    uint8_t bad[128];
+    size_t o = 0;
+
+    bad[o++] = 0x85; /* array(5): type, serial, field_mask, key_usage, V */
+    bad[o++] = 0x01; /* type implicit */
+    bad[o++] = 0x01; /* serial */
+    bad[o++] = 0x10; /* field_mask = SM2_IC_FIELD_KEY_USAGE */
+    bad[o++] = 0x19; /* uint16 */
+    bad[o++] = 0x01;
+    bad[o++] = 0x2C; /* key_usage = 300 (> 255) */
+    bad[o++] = 0x58;
+    bad[o++] = 0x21; /* public_recon_key len=33 */
+    memset(bad + o, 0x33, 33);
+    o += 33;
+
+    sm2_implicit_cert_t out;
+    TEST_ASSERT(sm2_ic_cbor_decode_cert(&out, bad, o) == SM2_IC_ERR_CBOR,
+        "Reject key_usage overflow");
 
     TEST_PASS();
 }
@@ -482,16 +511,56 @@ static void test_chain_success_rate()
     TEST_PASS();
 }
 
+static void test_serial_unpredictable_and_low_conflict()
+{
+    if (!g_ca_initialized)
+        test_setup_ca();
+
+    sm2_ic_cert_request_t req;
+    sm2_private_key_t temp_priv;
+    sm2_ic_cert_result_t res;
+    uint64_t serials[256];
+    size_t n = sizeof(serials) / sizeof(serials[0]);
+
+    TEST_ASSERT(sm2_ic_create_cert_request(&req, (uint8_t *)"SERIAL_CASE", 11,
+                    SM2_KU_DIGITAL_SIGNATURE, &temp_priv)
+            == SM2_IC_SUCCESS,
+        "Create Req");
+
+    for (size_t i = 0; i < n; i++)
+    {
+        TEST_ASSERT(sm2_ic_ca_generate_cert(
+                        &res, &req, (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub)
+                == SM2_IC_SUCCESS,
+            "Issue Cert");
+
+        TEST_ASSERT(res.cert.serial_number != 0, "Serial Non-Zero");
+        serials[i] = res.cert.serial_number;
+    }
+
+    for (size_t i = 0; i < n; i++)
+    {
+        for (size_t j = i + 1; j < n; j++)
+        {
+            TEST_ASSERT(serials[i] != serials[j], "Serial Collision");
+        }
+    }
+
+    TEST_PASS();
+}
+
 void run_test_ecqv_suite(void)
 {
-    RUN_TEST(test_setup_ca);
+    RUN_TEST(test_setup_ca_case);
     RUN_TEST(test_full_lifecycle);
     RUN_TEST(test_tampered_cert);
     RUN_TEST(test_cbor_robustness);
+    RUN_TEST(test_cbor_key_usage_overflow_rejected);
     RUN_TEST(test_field_mask_template);
     RUN_TEST(test_cert_size_reduction_by_mask);
     RUN_TEST(test_issue_ctx_accessor_and_param_defense);
     RUN_TEST(test_mask_zero_and_subject_id_boundary);
     RUN_TEST(test_performance);
     RUN_TEST(test_chain_success_rate);
+    RUN_TEST(test_serial_unpredictable_and_low_conflict);
 }

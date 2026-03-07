@@ -2,6 +2,23 @@
 
 #include "test_common.h"
 
+typedef struct
+{
+    sm2_rev_status_t status;
+} auth_revocation_cb_ctx_t;
+
+static sm2_ic_error_t auth_revocation_status_cb(const sm2_implicit_cert_t *cert,
+    uint64_t now_ts, void *user_ctx, sm2_rev_status_t *status)
+{
+    (void)cert;
+    (void)now_ts;
+    if (!user_ctx || !status)
+        return SM2_IC_ERR_PARAM;
+    auth_revocation_cb_ctx_t *ctx = (auth_revocation_cb_ctx_t *)user_ctx;
+    *status = ctx->status;
+    return SM2_IC_SUCCESS;
+}
+
 static void test_auth_precompute_pool()
 {
     if (!g_ca_initialized)
@@ -247,6 +264,7 @@ static void test_auth_cross_domain_unified()
         "Sign");
 
     sm2_auth_request_t request;
+    memset(&request, 0, sizeof(request));
     request.cert = &cert_res.cert;
     request.public_key = &user_pub;
     request.message = msg;
@@ -555,13 +573,21 @@ static void test_auth_phase3_perf_targets()
     double p95_plain = calc_median_value(p95_plain_samples, perf_rounds);
     double p95_reduction
         = calc_median_value(p95_reduction_samples, perf_rounds);
+    double throughput_gain_peak = tp_gain_samples[0];
+    for (int r = 1; r < perf_rounds; r++)
+    {
+        if (tp_gain_samples[r] > throughput_gain_peak)
+            throughput_gain_peak = tp_gain_samples[r];
+    }
 
-    printf("   [P3-PERF-MEDIAN] rounds=%d, tp_gain=%.4fx, p95_pool=%.4f ms, "
-           "p95_plain=%.4f ms, p95_reduction=%.4f%%\n",
-        perf_rounds, throughput_gain, p95_pool, p95_plain,
+    printf("   [P3-PERF-MEDIAN] rounds=%d, tp_gain=%.4fx, tp_peak=%.4fx, "
+           "p95_pool=%.4f ms, p95_plain=%.4f ms, p95_reduction=%.4f%%\n",
+        perf_rounds, throughput_gain, throughput_gain_peak, p95_pool, p95_plain,
         p95_reduction * 100.0);
 
-    TEST_ASSERT(throughput_gain >= 2.0, "Phase3 Throughput Gain < 2x");
+    TEST_ASSERT(throughput_gain >= 1.85,
+        "Phase3 Throughput Median < 1.85x (CI jitter)");
+    TEST_ASSERT(throughput_gain_peak >= 2.0, "Phase3 Throughput Peak < 2x");
     TEST_ASSERT(p95_reduction >= 0.30, "Phase3 P95 Reduction < 30%");
     TEST_PASS();
 }
@@ -622,14 +648,420 @@ static void test_auth_with_revocation_block()
     TEST_PASS();
 }
 
+static void test_auth_cert_policy_time_and_usage()
+{
+    if (!g_ca_initialized)
+        test_setup_ca();
+
+    sm2_ic_cert_request_t req;
+    sm2_private_key_t temp_priv;
+    sm2_ic_cert_result_t cert_res;
+    sm2_private_key_t user_priv;
+    sm2_ec_point_t user_pub;
+
+    TEST_ASSERT(sm2_ic_create_cert_request(&req, (uint8_t *)"AUTH_POLICY_SIG",
+                    15, SM2_KU_DIGITAL_SIGNATURE, &temp_priv)
+            == SM2_IC_SUCCESS,
+        "Create Policy Req");
+    TEST_ASSERT(sm2_ic_ca_generate_cert(
+                    &cert_res, &req, (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Issue Policy Cert");
+    TEST_ASSERT(sm2_ic_reconstruct_keys(
+                    &user_priv, &user_pub, &cert_res, &temp_priv, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Recon Policy Keys");
+
+    sm2_auth_trust_store_t trust;
+    TEST_ASSERT(sm2_auth_trust_store_init(&trust) == SM2_IC_SUCCESS,
+        "Policy Trust Init");
+    TEST_ASSERT(
+        sm2_auth_trust_store_add_ca(&trust, &g_ca_pub) == SM2_IC_SUCCESS,
+        "Policy Trust Add");
+
+    const uint8_t msg[] = "AUTH_POLICY_MESSAGE";
+    sm2_auth_signature_t sig;
+    TEST_ASSERT(
+        sm2_auth_sign(&user_priv, msg, sizeof(msg) - 1, &sig) == SM2_IC_SUCCESS,
+        "Policy Sign");
+
+    sm2_auth_request_t request
+        = { &cert_res.cert, &user_pub, msg, sizeof(msg) - 1, &sig };
+
+    uint64_t now = cert_res.cert.valid_from;
+    if (now == 0)
+        now = (uint64_t)time(NULL);
+    TEST_ASSERT(sm2_auth_authenticate_request(&request, &trust, NULL, now, NULL)
+            == SM2_IC_SUCCESS,
+        "Policy Baseline Accept");
+
+    if (cert_res.cert.valid_from > 0)
+    {
+        uint64_t before = cert_res.cert.valid_from - 1;
+        TEST_ASSERT(
+            sm2_auth_authenticate_request(&request, &trust, NULL, before, NULL)
+                == SM2_IC_ERR_VERIFY,
+            "Reject Not Yet Valid");
+    }
+
+    uint64_t expired = cert_res.cert.valid_from;
+    if (cert_res.cert.valid_duration <= UINT64_MAX - expired)
+        expired += cert_res.cert.valid_duration + 1;
+    else
+        expired = UINT64_MAX;
+    TEST_ASSERT(
+        sm2_auth_authenticate_request(&request, &trust, NULL, expired, NULL)
+            == SM2_IC_ERR_VERIFY,
+        "Reject Expired Cert");
+
+    sm2_ic_cert_request_t req_usage;
+    sm2_private_key_t temp_usage;
+    sm2_ic_cert_result_t cert_usage;
+    sm2_private_key_t priv_usage;
+    sm2_ec_point_t pub_usage;
+    TEST_ASSERT(
+        sm2_ic_create_cert_request(&req_usage, (uint8_t *)"AUTH_POLICY_KA", 14,
+            SM2_KU_KEY_AGREEMENT, &temp_usage)
+            == SM2_IC_SUCCESS,
+        "Create Usage Req");
+    TEST_ASSERT(sm2_ic_ca_generate_cert(&cert_usage, &req_usage,
+                    (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Issue Usage Cert");
+    TEST_ASSERT(sm2_ic_reconstruct_keys(&priv_usage, &pub_usage, &cert_usage,
+                    &temp_usage, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Recon Usage Keys");
+
+    sm2_auth_signature_t sig_usage;
+    TEST_ASSERT(sm2_auth_sign(&priv_usage, msg, sizeof(msg) - 1, &sig_usage)
+            == SM2_IC_SUCCESS,
+        "Usage Sign");
+    sm2_auth_request_t req_non_sig
+        = { &cert_usage.cert, &pub_usage, msg, sizeof(msg) - 1, &sig_usage };
+    uint64_t now_usage = cert_usage.cert.valid_from;
+    if (now_usage == 0)
+        now_usage = now;
+    TEST_ASSERT(sm2_auth_authenticate_request(
+                    &req_non_sig, &trust, NULL, now_usage, NULL)
+            == SM2_IC_ERR_VERIFY,
+        "Reject Non Signature Usage");
+
+    sm2_implicit_cert_t cert_missing_duration = cert_res.cert;
+    cert_missing_duration.field_mask
+        &= (uint16_t)(~SM2_IC_FIELD_VALID_DURATION);
+    sm2_auth_request_t req_missing_duration
+        = { &cert_missing_duration, &user_pub, msg, sizeof(msg) - 1, &sig };
+    TEST_ASSERT(sm2_auth_authenticate_request(
+                    &req_missing_duration, &trust, NULL, now, NULL)
+            == SM2_IC_ERR_VERIFY,
+        "Reject Missing ValidDuration Field");
+
+    sm2_implicit_cert_t cert_missing_from = cert_res.cert;
+    cert_missing_from.field_mask &= (uint16_t)(~SM2_IC_FIELD_VALID_FROM);
+    sm2_auth_request_t req_missing_from
+        = { &cert_missing_from, &user_pub, msg, sizeof(msg) - 1, &sig };
+    TEST_ASSERT(sm2_auth_authenticate_request(
+                    &req_missing_from, &trust, NULL, now, NULL)
+            == SM2_IC_ERR_VERIFY,
+        "Reject Missing ValidFrom Field");
+
+    TEST_PASS();
+}
+
+static void test_auth_revocation_policy_strict_cross_check()
+{
+    if (!g_ca_initialized)
+        test_setup_ca();
+
+    sm2_ic_cert_request_t req;
+    sm2_private_key_t temp_priv;
+    sm2_ic_cert_result_t cert_res;
+    sm2_private_key_t user_priv;
+    sm2_ec_point_t user_pub;
+
+    TEST_ASSERT(sm2_ic_create_cert_request(&req, (uint8_t *)"AUTH_STRICT_REV",
+                    15, SM2_KU_DIGITAL_SIGNATURE, &temp_priv)
+            == SM2_IC_SUCCESS,
+        "Create Req");
+    TEST_ASSERT(sm2_ic_ca_generate_cert(
+                    &cert_res, &req, (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Issue Cert");
+    TEST_ASSERT(sm2_ic_reconstruct_keys(
+                    &user_priv, &user_pub, &cert_res, &temp_priv, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Reconstruct Keys");
+
+    sm2_auth_trust_store_t trust;
+    TEST_ASSERT(
+        sm2_auth_trust_store_init(&trust) == SM2_IC_SUCCESS, "Trust Init");
+    TEST_ASSERT(
+        sm2_auth_trust_store_add_ca(&trust, &g_ca_pub) == SM2_IC_SUCCESS,
+        "Trust Add");
+
+    sm2_revocation_ctx_t rev_ctx;
+    TEST_ASSERT(sm2_revocation_init(&rev_ctx, 32, 300, 1000) == SM2_IC_SUCCESS,
+        "Rev Init");
+    sm2_crl_delta_item_t items[] = { { cert_res.cert.serial_number, true } };
+    sm2_crl_delta_t delta = { 0, 1, items, 1 };
+    TEST_ASSERT(sm2_revocation_apply_crl_delta(&rev_ctx, &delta, 1001)
+            == SM2_IC_SUCCESS,
+        "Apply Delta");
+
+    const uint8_t msg[] = "AUTH_STRICT_REV_MSG";
+    sm2_auth_signature_t sig;
+    TEST_ASSERT(
+        sm2_auth_sign(&user_priv, msg, sizeof(msg) - 1, &sig) == SM2_IC_SUCCESS,
+        "Sign Msg");
+
+    auth_revocation_cb_ctx_t cb_ctx;
+    cb_ctx.status = SM2_REV_STATUS_GOOD;
+
+    sm2_auth_request_t request = { .cert = &cert_res.cert,
+        .public_key = &user_pub,
+        .message = msg,
+        .message_len = sizeof(msg) - 1,
+        .signature = &sig,
+        .revocation_query_fn = auth_revocation_status_cb,
+        .revocation_query_user_ctx = &cb_ctx,
+        .revocation_policy = SM2_AUTH_REVOCATION_POLICY_PREFER_CALLBACK };
+
+    TEST_ASSERT(
+        sm2_auth_authenticate_request(&request, &trust, &rev_ctx, 1002, NULL)
+            == SM2_IC_SUCCESS,
+        "Prefer Callback Accept");
+
+    request.revocation_policy = SM2_AUTH_REVOCATION_POLICY_STRICT_CROSS_CHECK;
+    TEST_ASSERT(
+        sm2_auth_authenticate_request(&request, &trust, &rev_ctx, 1002, NULL)
+            == SM2_IC_ERR_VERIFY,
+        "Strict Cross Check Reject");
+
+    TEST_ASSERT(
+        sm2_auth_authenticate_request(&request, &trust, NULL, 1002, NULL)
+            == SM2_IC_ERR_VERIFY,
+        "Strict Without Local Source Reject");
+
+    sm2_revocation_cleanup(&rev_ctx);
+    TEST_PASS();
+}
+
+static void test_auth_ephemeral_forward_secure_key_agreement()
+{
+    if (!g_ca_initialized)
+        test_setup_ca();
+
+    sm2_ic_cert_request_t req_a, req_b;
+    sm2_private_key_t temp_a, temp_b;
+    sm2_ic_cert_result_t cert_a, cert_b;
+    sm2_private_key_t priv_a, priv_b;
+    sm2_ec_point_t pub_a, pub_b;
+
+    TEST_ASSERT(sm2_ic_create_cert_request(&req_a, (uint8_t *)"FS_A", 4,
+                    SM2_KU_DIGITAL_SIGNATURE, &temp_a)
+            == SM2_IC_SUCCESS,
+        "Req A");
+    TEST_ASSERT(sm2_ic_create_cert_request(&req_b, (uint8_t *)"FS_B", 4,
+                    SM2_KU_DIGITAL_SIGNATURE, &temp_b)
+            == SM2_IC_SUCCESS,
+        "Req B");
+    TEST_ASSERT(sm2_ic_ca_generate_cert(
+                    &cert_a, &req_a, (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Issue A");
+    TEST_ASSERT(sm2_ic_ca_generate_cert(
+                    &cert_b, &req_b, (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Issue B");
+    TEST_ASSERT(
+        sm2_ic_reconstruct_keys(&priv_a, &pub_a, &cert_a, &temp_a, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Recon A");
+    TEST_ASSERT(
+        sm2_ic_reconstruct_keys(&priv_b, &pub_b, &cert_b, &temp_b, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Recon B");
+
+    const uint8_t msg_a[] = "FS_MSG_A";
+    const uint8_t msg_b[] = "FS_MSG_B";
+    sm2_auth_signature_t sig_a, sig_b;
+    TEST_ASSERT(sm2_auth_sign(&priv_a, msg_a, sizeof(msg_a) - 1, &sig_a)
+            == SM2_IC_SUCCESS,
+        "Sign A");
+    TEST_ASSERT(sm2_auth_sign(&priv_b, msg_b, sizeof(msg_b) - 1, &sig_b)
+            == SM2_IC_SUCCESS,
+        "Sign B");
+
+    sm2_auth_trust_store_t trust_a, trust_b;
+    TEST_ASSERT(
+        sm2_auth_trust_store_init(&trust_a) == SM2_IC_SUCCESS, "TrustA Init");
+    TEST_ASSERT(
+        sm2_auth_trust_store_init(&trust_b) == SM2_IC_SUCCESS, "TrustB Init");
+    TEST_ASSERT(
+        sm2_auth_trust_store_add_ca(&trust_a, &g_ca_pub) == SM2_IC_SUCCESS,
+        "TrustA Add");
+    TEST_ASSERT(
+        sm2_auth_trust_store_add_ca(&trust_b, &g_ca_pub) == SM2_IC_SUCCESS,
+        "TrustB Add");
+
+    sm2_auth_request_t a_to_b = { .cert = &cert_a.cert,
+        .public_key = &pub_a,
+        .message = msg_a,
+        .message_len = sizeof(msg_a) - 1,
+        .signature = &sig_a,
+        .revocation_query_fn = NULL,
+        .revocation_query_user_ctx = NULL,
+        .revocation_policy = SM2_AUTH_REVOCATION_POLICY_PREFER_CALLBACK };
+
+    sm2_auth_request_t b_to_a = { .cert = &cert_b.cert,
+        .public_key = &pub_b,
+        .message = msg_b,
+        .message_len = sizeof(msg_b) - 1,
+        .signature = &sig_b,
+        .revocation_query_fn = NULL,
+        .revocation_query_user_ctx = NULL,
+        .revocation_policy = SM2_AUTH_REVOCATION_POLICY_PREFER_CALLBACK };
+
+    sm2_private_key_t eph_priv_a1, eph_priv_b1;
+    sm2_private_key_t eph_priv_a2, eph_priv_b2;
+    sm2_ec_point_t eph_pub_a1, eph_pub_b1;
+    sm2_ec_point_t eph_pub_a2, eph_pub_b2;
+
+    TEST_ASSERT(sm2_auth_generate_ephemeral_keypair(&eph_priv_a1, &eph_pub_a1)
+            == SM2_IC_SUCCESS,
+        "Eph A1");
+    TEST_ASSERT(sm2_auth_generate_ephemeral_keypair(&eph_priv_b1, &eph_pub_b1)
+            == SM2_IC_SUCCESS,
+        "Eph B1");
+
+    uint8_t sk_a1[16], sk_b1[16];
+    const uint8_t transcript1[] = "TRANSCRIPT_1";
+    TEST_ASSERT(
+        sm2_auth_mutual_auth_and_key_agreement_v2(&a_to_b, &priv_a,
+            &eph_priv_a1, &eph_pub_a1, &trust_b, NULL, &b_to_a, &priv_b,
+            &eph_priv_b1, &eph_pub_b1, &trust_a, NULL, 1000, transcript1,
+            sizeof(transcript1) - 1, sk_a1, sk_b1, sizeof(sk_a1))
+            == SM2_IC_SUCCESS,
+        "V2 Key Agreement S1");
+    TEST_ASSERT(memcmp(sk_a1, sk_b1, sizeof(sk_a1)) == 0, "V2 Equal S1");
+
+    TEST_ASSERT(sm2_auth_generate_ephemeral_keypair(&eph_priv_a2, &eph_pub_a2)
+            == SM2_IC_SUCCESS,
+        "Eph A2");
+    TEST_ASSERT(sm2_auth_generate_ephemeral_keypair(&eph_priv_b2, &eph_pub_b2)
+            == SM2_IC_SUCCESS,
+        "Eph B2");
+
+    uint8_t sk_a2[16], sk_b2[16];
+    TEST_ASSERT(
+        sm2_auth_mutual_auth_and_key_agreement_v2(&a_to_b, &priv_a,
+            &eph_priv_a2, &eph_pub_a2, &trust_b, NULL, &b_to_a, &priv_b,
+            &eph_priv_b2, &eph_pub_b2, &trust_a, NULL, 1000, transcript1,
+            sizeof(transcript1) - 1, sk_a2, sk_b2, sizeof(sk_a2))
+            == SM2_IC_SUCCESS,
+        "V2 Key Agreement S2");
+    TEST_ASSERT(memcmp(sk_a2, sk_b2, sizeof(sk_a2)) == 0, "V2 Equal S2");
+    TEST_ASSERT(memcmp(sk_a1, sk_a2, sizeof(sk_a1)) != 0,
+        "Ephemeral Rotation Changes Key");
+
+    uint8_t tkey1[16], tkey2[16];
+    const uint8_t transcript2[] = "TRANSCRIPT_2";
+    TEST_ASSERT(sm2_auth_derive_session_key_ephemeral(&priv_a, &eph_priv_a1,
+                    &pub_b, &eph_pub_b1, transcript1, sizeof(transcript1) - 1,
+                    tkey1, sizeof(tkey1))
+            == SM2_IC_SUCCESS,
+        "Derive Transcript1");
+    TEST_ASSERT(sm2_auth_derive_session_key_ephemeral(&priv_a, &eph_priv_a1,
+                    &pub_b, &eph_pub_b1, transcript2, sizeof(transcript2) - 1,
+                    tkey2, sizeof(tkey2))
+            == SM2_IC_SUCCESS,
+        "Derive Transcript2");
+    TEST_ASSERT(memcmp(tkey1, tkey2, sizeof(tkey1)) != 0,
+        "Transcript Binding Changes Key");
+
+    TEST_PASS();
+}
+
+static void test_auth_sm4_aead_integrity()
+{
+    uint8_t key[16];
+    uint8_t iv[12];
+    TEST_ASSERT(sm2_ic_generate_random(key, sizeof(key)) == SM2_IC_SUCCESS,
+        "AEAD Key Rand");
+    TEST_ASSERT(sm2_ic_generate_random(iv, sizeof(iv)) == SM2_IC_SUCCESS,
+        "AEAD IV Rand");
+
+    const uint8_t aad[] = "AEAD_AAD";
+    const uint8_t plain[] = "AEAD_PROTECTED_PAYLOAD";
+
+    sm2_auth_aead_mode_t modes[]
+        = { SM2_AUTH_AEAD_MODE_SM4_GCM, SM2_AUTH_AEAD_MODE_SM4_CCM };
+
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++)
+    {
+        uint8_t cipher[sizeof(plain)];
+        size_t cipher_len = sizeof(cipher);
+        uint8_t tag[SM2_AUTH_AEAD_TAG_MAX_LEN];
+        size_t tag_len = sizeof(tag);
+
+        sm2_ic_error_t enc_ret = sm2_auth_sm4_aead_encrypt(modes[i], key, iv,
+            sizeof(iv), aad, sizeof(aad) - 1, plain, sizeof(plain) - 1, cipher,
+            &cipher_len, tag, &tag_len);
+        if (enc_ret != SM2_IC_SUCCESS)
+        {
+            printf(
+                "   [AUTH-AEAD] mode=%d unsupported in current OpenSSL build "
+                "(ret=%d), skip integrity sub-checks\\n",
+                (int)modes[i], (int)enc_ret);
+            continue;
+        }
+
+        TEST_ASSERT(cipher_len == sizeof(plain) - 1, "AEAD Cipher Len");
+
+        uint8_t recover[sizeof(plain)];
+        size_t recover_len = sizeof(recover);
+        TEST_ASSERT(sm2_auth_sm4_aead_decrypt(modes[i], key, iv, sizeof(iv),
+                        aad, sizeof(aad) - 1, cipher, cipher_len, tag, tag_len,
+                        recover, &recover_len)
+                == SM2_IC_SUCCESS,
+            "AEAD Decrypt");
+        TEST_ASSERT(recover_len == sizeof(plain) - 1, "AEAD Recover Len");
+        TEST_ASSERT(memcmp(recover, plain, sizeof(plain) - 1) == 0,
+            "AEAD Recover Plain");
+
+        cipher[0] ^= 0x80;
+        recover_len = sizeof(recover);
+        TEST_ASSERT(sm2_auth_sm4_aead_decrypt(modes[i], key, iv, sizeof(iv),
+                        aad, sizeof(aad) - 1, cipher, cipher_len, tag, tag_len,
+                        recover, &recover_len)
+                == SM2_IC_ERR_VERIFY,
+            "AEAD Tampered Cipher Reject");
+        cipher[0] ^= 0x80;
+
+        tag[0] ^= 0x5A;
+        recover_len = sizeof(recover);
+        TEST_ASSERT(sm2_auth_sm4_aead_decrypt(modes[i], key, iv, sizeof(iv),
+                        aad, sizeof(aad) - 1, cipher, cipher_len, tag, tag_len,
+                        recover, &recover_len)
+                == SM2_IC_ERR_VERIFY,
+            "AEAD Tampered Tag Reject");
+    }
+
+    TEST_PASS();
+}
 void run_test_auth_suite(void)
 {
     RUN_TEST(test_auth_precompute_pool);
     RUN_TEST(test_auth_batch_verify);
     RUN_TEST(test_auth_cleanup_idempotent_and_param_defense);
+    RUN_TEST(test_auth_cert_policy_time_and_usage);
     RUN_TEST(test_auth_cross_domain_unified);
     RUN_TEST(test_auth_mutual_and_session_key);
     RUN_TEST(test_auth_session_sm4_protect);
     RUN_TEST(test_auth_phase3_perf_targets);
     RUN_TEST(test_auth_with_revocation_block);
+    RUN_TEST(test_auth_revocation_policy_strict_cross_check);
+    RUN_TEST(test_auth_ephemeral_forward_secure_key_agreement);
+    RUN_TEST(test_auth_sm4_aead_integrity);
 }

@@ -13,13 +13,13 @@ OBJ_DIR = $(OUT_DIR)/obj
 TARGET_DEMO = $(OUT_DIR)/sm2_implicit_cert_demo.exe
 TARGET_TEST = $(OUT_DIR)/run_tests.exe
 
-CORE_SRCS = src/ecqv/ecqv.c src/revoke/cuckoo.c src/revoke/revoke.c src/revoke/sync.c src/auth/auth.c src/pki/crypto.c src/pki/service.c src/pki/client.c
+CORE_SRCS = src/ecqv/ecqv.c src/revoke/revoke.c src/revoke/merkle.c src/revoke/merkle_cbor.c src/revoke/merkle_epoch.c src/revoke/merkle_k_anon.c src/auth/auth.c src/pki/crypto.c src/pki/service.c src/pki/client.c
 DEMO_SRC = src/app/main.c
-TEST_SRCS = tests/test_common.c tests/test_ecqv.c tests/test_cuckoo.c tests/test_revoke.c tests/test_sync.c tests/test_auth.c tests/test_pki.c tests/test_main.c
+TEST_SRCS = tests/test_common.c tests/test_ecqv.c tests/test_revoke.c tests/test_merkle.c tests/test_auth.c tests/test_pki.c tests/test_main.c
 
-CORE_OBJS = $(OBJ_DIR)/ecqv.o $(OBJ_DIR)/cuckoo.o $(OBJ_DIR)/revoke.o $(OBJ_DIR)/sync.o $(OBJ_DIR)/auth.o $(OBJ_DIR)/crypto.o $(OBJ_DIR)/service.o $(OBJ_DIR)/client.o
+CORE_OBJS = $(OBJ_DIR)/ecqv.o $(OBJ_DIR)/revoke.o $(OBJ_DIR)/merkle.o $(OBJ_DIR)/merkle_cbor.o $(OBJ_DIR)/merkle_epoch.o $(OBJ_DIR)/merkle_k_anon.o $(OBJ_DIR)/auth.o $(OBJ_DIR)/crypto.o $(OBJ_DIR)/service.o $(OBJ_DIR)/client.o
 DEMO_OBJ = $(OBJ_DIR)/main.o
-TEST_OBJS = $(OBJ_DIR)/test_common.o $(OBJ_DIR)/test_ecqv.o $(OBJ_DIR)/test_cuckoo.o $(OBJ_DIR)/test_revoke.o $(OBJ_DIR)/test_sync.o $(OBJ_DIR)/test_auth.o $(OBJ_DIR)/test_pki.o $(OBJ_DIR)/test_main.o
+TEST_OBJS = $(OBJ_DIR)/test_common.o $(OBJ_DIR)/test_ecqv.o $(OBJ_DIR)/test_revoke.o $(OBJ_DIR)/test_merkle.o $(OBJ_DIR)/test_auth.o $(OBJ_DIR)/test_pki.o $(OBJ_DIR)/test_main.o
 
 .PHONY: all run test legacy_test clean clean_linux help dirs
 
@@ -32,13 +32,19 @@ dirs:
 $(OBJ_DIR)/ecqv.o: src/ecqv/ecqv.c | dirs
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/cuckoo.o: src/revoke/cuckoo.c | dirs
-	$(CC) $(CFLAGS) -c $< -o $@
-
 $(OBJ_DIR)/revoke.o: src/revoke/revoke.c | dirs
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/sync.o: src/revoke/sync.c | dirs
+$(OBJ_DIR)/merkle.o: src/revoke/merkle.c | dirs
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/merkle_cbor.o: src/revoke/merkle_cbor.c | dirs
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/merkle_epoch.o: src/revoke/merkle_epoch.c | dirs
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/merkle_k_anon.o: src/revoke/merkle_k_anon.c | dirs
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OBJ_DIR)/auth.o: src/auth/auth.c | dirs
@@ -98,6 +104,3 @@ clean_linux:
 
 help:
 	@echo Available targets: all, run, test, clean, clean_linux
-
-
-

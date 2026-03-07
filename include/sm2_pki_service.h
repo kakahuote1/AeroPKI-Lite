@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+
 #include "sm2_crypto.h"
 #include "sm2_revocation.h"
 #include "sm2_implicit_cert.h"
@@ -64,7 +65,6 @@ extern "C"
     sm2_pki_error_t sm2_pki_service_set_cert_field_mask(
         sm2_pki_service_ctx_t *ctx, uint16_t field_mask);
 
-    /* Unified API names required by Phase4-S05. */
     sm2_pki_error_t sm2_pki_identity_register(sm2_pki_service_ctx_t *ctx,
         const uint8_t *identity, size_t identity_len, uint8_t key_usage);
 
@@ -81,10 +81,6 @@ extern "C"
     sm2_pki_error_t sm2_pki_revoke_check(sm2_pki_service_ctx_t *ctx,
         uint64_t serial_number, uint64_t now_ts, sm2_rev_status_t *status,
         sm2_rev_source_t *source);
-
-    sm2_pki_error_t sm2_pki_service_build_ocsp_cfg(sm2_pki_service_ctx_t *ctx,
-        uint32_t timeout_ms, uint8_t retry_count, size_t cache_capacity,
-        sm2_ocsp_client_cfg_t *cfg);
 
 #ifdef __cplusplus
 }

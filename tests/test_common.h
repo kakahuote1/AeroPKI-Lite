@@ -60,10 +60,9 @@ double calc_median_value(double *samples, size_t count);
 void test_setup_ca(void);
 
 void run_test_ecqv_suite(void);
-void run_test_cuckoo_suite(void);
 void run_test_revoke_suite(void);
-void run_test_sync_suite(void);
 void run_test_auth_suite(void);
 void run_test_pki_suite(void);
+void run_test_merkle_suite(void);
 
 #endif

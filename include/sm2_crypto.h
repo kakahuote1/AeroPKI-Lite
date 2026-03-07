@@ -29,6 +29,8 @@ extern "C"
         SM2_PKI_ERR_CONFLICT = -106
     } sm2_pki_error_t;
 
+    typedef sm2_auth_aead_mode_t sm2_pki_aead_mode_t;
+
     sm2_pki_error_t sm2_pki_error_from_ic(sm2_ic_error_t err);
 
     sm2_pki_error_t sm2_pki_random(uint8_t *buf, size_t len);
@@ -49,6 +51,18 @@ extern "C"
 
     sm2_pki_error_t sm2_pki_sm4_decrypt(const uint8_t key[16],
         const uint8_t iv[16], const uint8_t *ciphertext, size_t ciphertext_len,
+        uint8_t *plaintext, size_t *plaintext_len);
+
+    sm2_pki_error_t sm2_pki_sm4_aead_encrypt(sm2_pki_aead_mode_t mode,
+        const uint8_t key[16], const uint8_t *iv, size_t iv_len,
+        const uint8_t *aad, size_t aad_len, const uint8_t *plaintext,
+        size_t plaintext_len, uint8_t *ciphertext, size_t *ciphertext_len,
+        uint8_t *tag, size_t *tag_len);
+
+    sm2_pki_error_t sm2_pki_sm4_aead_decrypt(sm2_pki_aead_mode_t mode,
+        const uint8_t key[16], const uint8_t *iv, size_t iv_len,
+        const uint8_t *aad, size_t aad_len, const uint8_t *ciphertext,
+        size_t ciphertext_len, const uint8_t *tag, size_t tag_len,
         uint8_t *plaintext, size_t *plaintext_len);
 
 #ifdef __cplusplus

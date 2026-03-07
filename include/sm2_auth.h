@@ -22,6 +22,7 @@ extern "C"
 
 #define SM2_AUTH_MAX_SIG_DER_LEN 96
 #define SM2_AUTH_MAX_CA_STORE 16
+#define SM2_AUTH_AEAD_TAG_MAX_LEN 16
 
     typedef struct
     {
@@ -52,6 +53,22 @@ extern "C"
         size_t count;
     } sm2_auth_trust_store_t;
 
+    typedef sm2_ic_error_t (*sm2_auth_revocation_query_fn)(
+        const sm2_implicit_cert_t *cert, uint64_t now_ts, void *user_ctx,
+        sm2_rev_status_t *status);
+
+    typedef enum
+    {
+        SM2_AUTH_REVOCATION_POLICY_PREFER_CALLBACK = 0,
+        SM2_AUTH_REVOCATION_POLICY_STRICT_CROSS_CHECK = 1
+    } sm2_auth_revocation_policy_t;
+
+    typedef enum
+    {
+        SM2_AUTH_AEAD_MODE_SM4_GCM = 1,
+        SM2_AUTH_AEAD_MODE_SM4_CCM = 2
+    } sm2_auth_aead_mode_t;
+
     typedef struct
     {
         const sm2_implicit_cert_t *cert;
@@ -59,6 +76,10 @@ extern "C"
         const uint8_t *message;
         size_t message_len;
         const sm2_auth_signature_t *signature;
+        sm2_auth_revocation_query_fn revocation_query_fn;
+        void *revocation_query_user_ctx;
+        sm2_auth_revocation_policy_t revocation_policy;
+        bool lightweight_mode;
     } sm2_auth_request_t;
 
     typedef struct
@@ -119,12 +140,51 @@ extern "C"
         sm2_revocation_ctx_t *a_rev_ctx, uint64_t now_ts,
         uint8_t *session_key_a, uint8_t *session_key_b, size_t session_key_len);
 
+    sm2_ic_error_t sm2_auth_generate_ephemeral_keypair(
+        sm2_private_key_t *ephemeral_private_key,
+        sm2_ec_point_t *ephemeral_public_key);
+
+    sm2_ic_error_t sm2_auth_derive_session_key_ephemeral(
+        const sm2_private_key_t *local_private_key,
+        const sm2_private_key_t *local_ephemeral_private_key,
+        const sm2_ec_point_t *peer_public_key,
+        const sm2_ec_point_t *peer_ephemeral_public_key,
+        const uint8_t *transcript, size_t transcript_len, uint8_t *session_key,
+        size_t session_key_len);
+
+    sm2_ic_error_t sm2_auth_mutual_auth_and_key_agreement_v2(
+        const sm2_auth_request_t *a_to_b,
+        const sm2_private_key_t *a_private_key,
+        const sm2_private_key_t *a_ephemeral_private_key,
+        const sm2_ec_point_t *a_ephemeral_public_key,
+        const sm2_auth_trust_store_t *b_trust_store,
+        sm2_revocation_ctx_t *b_rev_ctx, const sm2_auth_request_t *b_to_a,
+        const sm2_private_key_t *b_private_key,
+        const sm2_private_key_t *b_ephemeral_private_key,
+        const sm2_ec_point_t *b_ephemeral_public_key,
+        const sm2_auth_trust_store_t *a_trust_store,
+        sm2_revocation_ctx_t *a_rev_ctx, uint64_t now_ts,
+        const uint8_t *transcript, size_t transcript_len,
+        uint8_t *session_key_a, uint8_t *session_key_b, size_t session_key_len);
+
     sm2_ic_error_t sm2_auth_sm4_encrypt(const uint8_t key[16],
         const uint8_t iv[16], const uint8_t *plaintext, size_t plaintext_len,
         uint8_t *ciphertext, size_t *ciphertext_len);
 
     sm2_ic_error_t sm2_auth_sm4_decrypt(const uint8_t key[16],
         const uint8_t iv[16], const uint8_t *ciphertext, size_t ciphertext_len,
+        uint8_t *plaintext, size_t *plaintext_len);
+
+    sm2_ic_error_t sm2_auth_sm4_aead_encrypt(sm2_auth_aead_mode_t mode,
+        const uint8_t key[16], const uint8_t *iv, size_t iv_len,
+        const uint8_t *aad, size_t aad_len, const uint8_t *plaintext,
+        size_t plaintext_len, uint8_t *ciphertext, size_t *ciphertext_len,
+        uint8_t *tag, size_t *tag_len);
+
+    sm2_ic_error_t sm2_auth_sm4_aead_decrypt(sm2_auth_aead_mode_t mode,
+        const uint8_t key[16], const uint8_t *iv, size_t iv_len,
+        const uint8_t *aad, size_t aad_len, const uint8_t *ciphertext,
+        size_t ciphertext_len, const uint8_t *tag, size_t tag_len,
         uint8_t *plaintext, size_t *plaintext_len);
 
 #ifdef __cplusplus

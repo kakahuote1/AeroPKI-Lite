@@ -2,23 +2,63 @@
 
 /**
  * @file revoke.c
- * @brief Revocation state management and OCSP/CRL query path.
+ * @brief Revocation state management for Merkle-only query path.
  */
 
-#include "revoke_internal.h"
+#include "sm2_revocation.h"
 #include "sm2_secure_mem.h"
+
 #include <stdlib.h>
 #include <string.h>
 
-#define utils_next_pow2 sm2_rev_internal_next_pow2
-#define utils_refresh_filter_param_hash                                        \
-    sm2_rev_internal_refresh_filter_param_hash
-#define cuckoo_reset sm2_rev_internal_cuckoo_reset
-#define cuckoo_insert sm2_rev_internal_cuckoo_insert
-#define cuckoo_delete sm2_rev_internal_cuckoo_delete
-#define cuckoo_contains sm2_rev_internal_cuckoo_contains
-#define rebuild_filter sm2_rev_internal_rebuild_filter
-#define sync_log_append sm2_rev_internal_sync_log_append
+static sm2_rev_congestion_signal_t calc_congestion_signal(
+    const sm2_revocation_ctx_t *ctx)
+{
+    if (!ctx)
+        return SM2_REV_CONGESTION_NORMAL;
+
+    size_t busy = ctx->congestion_busy_threshold;
+    size_t overload = ctx->congestion_overload_threshold;
+    if (busy == 0)
+        busy = 64;
+    if (overload <= busy)
+        overload = busy + 1;
+
+    if (ctx->query_inflight >= overload)
+        return SM2_REV_CONGESTION_OVERLOAD;
+    if (ctx->query_inflight >= busy)
+        return SM2_REV_CONGESTION_BUSY;
+    return SM2_REV_CONGESTION_NORMAL;
+}
+
+static uint32_t route_effective_weight(
+    const sm2_rev_route_node_t *node, bool include_overload)
+{
+    if (!node || !node->enabled || node->node_id_len == 0
+        || node->node_id_len > SM2_REV_SYNC_NODE_ID_MAX_LEN
+        || node->base_weight == 0)
+    {
+        return 0;
+    }
+
+    if (!include_overload
+        && node->congestion_signal == SM2_REV_CONGESTION_OVERLOAD)
+    {
+        return 0;
+    }
+
+    uint32_t weight = node->base_weight;
+    if (node->congestion_signal == SM2_REV_CONGESTION_BUSY)
+    {
+        weight = (weight + 1U) / 2U;
+    }
+    else if (node->congestion_signal == SM2_REV_CONGESTION_OVERLOAD)
+    {
+        weight = (weight + 7U) / 8U;
+    }
+
+    return weight == 0 ? 1U : weight;
+}
 
 static sm2_ic_error_t local_list_reserve(
     sm2_revocation_ctx_t *ctx, size_t target_count)
@@ -28,48 +68,33 @@ static sm2_ic_error_t local_list_reserve(
     if (target_count <= ctx->revoked_capacity)
         return SM2_IC_SUCCESS;
 
-    size_t new_cap = (ctx->revoked_capacity == 0) ? 64 : ctx->revoked_capacity;
+    size_t new_cap = ctx->revoked_capacity == 0 ? 64 : ctx->revoked_capacity;
     while (new_cap < target_count)
     {
-        if (new_cap > (SIZE_MAX / 2))
+        if (new_cap > SIZE_MAX / 2)
             return SM2_IC_ERR_MEMORY;
         new_cap *= 2;
     }
-    if (new_cap > (SIZE_MAX / sizeof(uint64_t)))
+
+    uint64_t *new_list
+        = (uint64_t *)realloc(ctx->revoked_serials, new_cap * sizeof(uint64_t));
+    if (!new_list)
         return SM2_IC_ERR_MEMORY;
 
-    uint64_t *new_mem = (uint64_t *)malloc(new_cap * sizeof(uint64_t));
-    if (!new_mem)
-        return SM2_IC_ERR_MEMORY;
-
-    if (ctx->revoked_serials)
-    {
-        if (ctx->revoked_count > 0)
-        {
-            memcpy(new_mem, ctx->revoked_serials,
-                ctx->revoked_count * sizeof(uint64_t));
-        }
-        sm2_secure_memzero(
-            ctx->revoked_serials, ctx->revoked_capacity * sizeof(uint64_t));
-        free(ctx->revoked_serials);
-    }
-
-    ctx->revoked_serials = new_mem;
+    ctx->revoked_serials = new_list;
     ctx->revoked_capacity = new_cap;
     return SM2_IC_SUCCESS;
 }
+
 static sm2_ic_error_t local_list_add(sm2_revocation_ctx_t *ctx, uint64_t serial)
 {
     if (!ctx)
         return SM2_IC_ERR_PARAM;
 
-    if (cuckoo_contains(&ctx->filter, serial))
+    for (size_t i = 0; i < ctx->revoked_count; i++)
     {
-        for (size_t i = 0; i < ctx->revoked_count; i++)
-        {
-            if (ctx->revoked_serials[i] == serial)
-                return SM2_IC_SUCCESS;
-        }
+        if (ctx->revoked_serials[i] == serial)
+            return SM2_IC_SUCCESS;
     }
 
     sm2_ic_error_t ret = local_list_reserve(ctx, ctx->revoked_count + 1);
@@ -79,78 +104,51 @@ static sm2_ic_error_t local_list_add(sm2_revocation_ctx_t *ctx, uint64_t serial)
     ctx->revoked_serials[ctx->revoked_count++] = serial;
     return SM2_IC_SUCCESS;
 }
+
 static void local_list_remove(sm2_revocation_ctx_t *ctx, uint64_t serial)
 {
+    if (!ctx)
+        return;
+
     for (size_t i = 0; i < ctx->revoked_count; i++)
     {
         if (ctx->revoked_serials[i] == serial)
         {
-            ctx->revoked_serials[i]
-                = ctx->revoked_serials[ctx->revoked_count - 1];
+            if (i + 1 < ctx->revoked_count)
+            {
+                memmove(&ctx->revoked_serials[i], &ctx->revoked_serials[i + 1],
+                    (ctx->revoked_count - i - 1) * sizeof(uint64_t));
+            }
             ctx->revoked_count--;
             return;
         }
     }
 }
 
-sm2_ic_error_t sm2_rev_internal_local_list_add(
-    sm2_revocation_ctx_t *ctx, uint64_t serial)
+static sm2_ic_error_t query_merkle_callback(sm2_revocation_ctx_t *ctx,
+    uint64_t serial_number, uint64_t now_ts, sm2_rev_status_t *status,
+    sm2_rev_source_t *source)
 {
-    return local_list_add(ctx, serial);
-}
+    if (!ctx || !ctx->merkle_query_fn || !status || !source)
+        return SM2_IC_ERR_PARAM;
 
-void sm2_rev_internal_local_list_remove(
-    sm2_revocation_ctx_t *ctx, uint64_t serial)
-{
-    local_list_remove(ctx, serial);
-}
+    sm2_implicit_cert_t cert;
+    memset(&cert, 0, sizeof(cert));
+    cert.serial_number = serial_number;
 
-static sm2_ocsp_cache_entry_t *cache_find(
-    sm2_revocation_ctx_t *ctx, uint64_t serial)
-{
-    for (size_t i = 0; i < ctx->ocsp_cache_capacity; i++)
+    sm2_ic_error_t ret = ctx->merkle_query_fn(
+        &cert, now_ts, ctx->merkle_query_user_ctx, status);
+    if (ret != SM2_IC_SUCCESS)
+        return ret;
+
+    if (*status != SM2_REV_STATUS_GOOD && *status != SM2_REV_STATUS_REVOKED
+        && *status != SM2_REV_STATUS_UNKNOWN)
     {
-        if (ctx->ocsp_cache[i].used
-            && ctx->ocsp_cache[i].serial_number == serial)
-        {
-            return &ctx->ocsp_cache[i];
-        }
+        return SM2_IC_ERR_VERIFY;
     }
-    return NULL;
-}
 
-static sm2_ocsp_cache_entry_t *cache_pick_slot(sm2_revocation_ctx_t *ctx)
-{
-    if (!ctx || !ctx->ocsp_cache || ctx->ocsp_cache_capacity == 0)
-        return NULL;
-
-    sm2_ocsp_cache_entry_t *victim = &ctx->ocsp_cache[0];
-    for (size_t i = 0; i < ctx->ocsp_cache_capacity; i++)
-    {
-        sm2_ocsp_cache_entry_t *entry = &ctx->ocsp_cache[i];
-        if (!entry->used)
-            return entry;
-        if (!victim->used || entry->expires_at < victim->expires_at)
-            victim = entry;
-    }
-    return victim;
-}
-static void cache_put(sm2_revocation_ctx_t *ctx, uint64_t serial,
-    sm2_rev_status_t status, uint64_t expires_at)
-{
-    if (!ctx->ocsp_cache || ctx->ocsp_cache_capacity == 0)
-        return;
-
-    sm2_ocsp_cache_entry_t *e = cache_find(ctx, serial);
-    if (!e)
-        e = cache_pick_slot(ctx);
-    if (!e)
-        return;
-
-    e->used = true;
-    e->serial_number = serial;
-    e->status = status;
-    e->expires_at = expires_at;
+    *source = SM2_REV_SOURCE_MERKLE_NODE;
+    return SM2_IC_SUCCESS;
 }
 
 sm2_ic_error_t sm2_revocation_init(sm2_revocation_ctx_t *ctx,
@@ -158,30 +156,25 @@ sm2_ic_error_t sm2_revocation_init(sm2_revocation_ctx_t *ctx,
 {
     if (!ctx || filter_ttl_sec == 0)
         return SM2_IC_ERR_PARAM;
+
     memset(ctx, 0, sizeof(*ctx));
+    ctx->root_valid_ttl_sec = filter_ttl_sec;
+    ctx->root_valid_until = now_ts + filter_ttl_sec;
 
-    size_t bucket_count = utils_next_pow2((expected_revoked_items / 3) + 64);
-    if (bucket_count < 64)
-        bucket_count = 64;
+    ctx->query_inflight = 0;
+    ctx->congestion_busy_threshold = 64;
+    ctx->congestion_overload_threshold = 128;
+    ctx->congestion_signal = SM2_REV_CONGESTION_NORMAL;
+    ctx->clock_skew_tolerance_sec = 300;
 
-    sm2_ic_error_t ret = cuckoo_reset(&ctx->filter, bucket_count, 4, 500, 32);
-    if (ret != SM2_IC_SUCCESS)
-        return ret;
+    if (expected_revoked_items > 0)
+    {
+        sm2_ic_error_t ret = local_list_reserve(ctx, expected_revoked_items);
+        if (ret != SM2_IC_SUCCESS)
+            return ret;
+    }
 
-    ctx->filter_ttl_sec = filter_ttl_sec;
-    ctx->filter_expire_at = now_ts + filter_ttl_sec;
-    ctx->crl_version = 0;
-    ctx->online_mode = false;
-
-    ctx->sync_epoch = 1;
-    ctx->sync_log_window = 2048;
-    ctx->sync_log_head = 0;
-    ctx->last_sync_ts = 0;
-    ctx->last_sync_nonce = 0;
-    ctx->sync_max_items_per_packet = 256;
-    ctx->sync_min_export_interval_sec = 0;
-
-    return utils_refresh_filter_param_hash(ctx);
+    return SM2_IC_SUCCESS;
 }
 
 void sm2_revocation_cleanup(sm2_revocation_ctx_t *ctx)
@@ -189,97 +182,33 @@ void sm2_revocation_cleanup(sm2_revocation_ctx_t *ctx)
     if (!ctx)
         return;
 
-    if (ctx->filter.fingerprints)
-    {
-        sm2_secure_memzero(ctx->filter.fingerprints,
-            ctx->filter.bucket_count * ctx->filter.bucket_size
-                * sizeof(uint32_t));
-    }
     if (ctx->revoked_serials && ctx->revoked_capacity > 0)
     {
         sm2_secure_memzero(
             ctx->revoked_serials, ctx->revoked_capacity * sizeof(uint64_t));
     }
-    if (ctx->ocsp_cache && ctx->ocsp_cache_capacity > 0)
-    {
-        sm2_secure_memzero(ctx->ocsp_cache,
-            ctx->ocsp_cache_capacity * sizeof(sm2_ocsp_cache_entry_t));
-    }
-    if (ctx->sync_log && ctx->sync_log_capacity > 0)
-    {
-        sm2_secure_memzero(ctx->sync_log,
-            ctx->sync_log_capacity * sizeof(sm2_rev_sync_log_entry_t));
-    }
 
-    free(ctx->filter.fingerprints);
     free(ctx->revoked_serials);
-    free(ctx->ocsp_cache);
-    free(ctx->sync_log);
     sm2_secure_memzero(ctx, sizeof(*ctx));
 }
-sm2_ic_error_t sm2_revocation_set_online(
-    sm2_revocation_ctx_t *ctx, bool online_mode)
+
+sm2_ic_error_t sm2_revocation_set_merkle_query(
+    sm2_revocation_ctx_t *ctx, sm2_rev_merkle_query_fn query_fn, void *user_ctx)
 {
     if (!ctx)
         return SM2_IC_ERR_PARAM;
-    ctx->online_mode = online_mode;
+
+    ctx->merkle_query_fn = query_fn;
+    ctx->merkle_query_user_ctx = user_ctx;
     return SM2_IC_SUCCESS;
-}
-
-sm2_ic_error_t sm2_revocation_config_ocsp(
-    sm2_revocation_ctx_t *ctx, const sm2_ocsp_client_cfg_t *cfg)
-{
-    if (!ctx || !cfg)
-        return SM2_IC_ERR_PARAM;
-
-    ctx->ocsp_cfg = *cfg;
-    if (ctx->ocsp_cfg.cache_capacity == 0)
-    {
-        if (ctx->ocsp_cache && ctx->ocsp_cache_capacity > 0)
-        {
-            sm2_secure_memzero(ctx->ocsp_cache,
-                ctx->ocsp_cache_capacity * sizeof(sm2_ocsp_cache_entry_t));
-        }
-        free(ctx->ocsp_cache);
-        ctx->ocsp_cache = NULL;
-        ctx->ocsp_cache_capacity = 0;
-        return SM2_IC_SUCCESS;
-    }
-
-    sm2_ocsp_cache_entry_t *new_cache = (sm2_ocsp_cache_entry_t *)calloc(
-        cfg->cache_capacity, sizeof(sm2_ocsp_cache_entry_t));
-    if (!new_cache)
-        return SM2_IC_ERR_MEMORY;
-
-    if (ctx->ocsp_cache && ctx->ocsp_cache_capacity > 0)
-    {
-        sm2_secure_memzero(ctx->ocsp_cache,
-            ctx->ocsp_cache_capacity * sizeof(sm2_ocsp_cache_entry_t));
-    }
-    free(ctx->ocsp_cache);
-    ctx->ocsp_cache = new_cache;
-    ctx->ocsp_cache_capacity = cfg->cache_capacity;
-    return SM2_IC_SUCCESS;
-}
-sm2_ic_error_t sm2_revocation_config_local_filter(sm2_revocation_ctx_t *ctx,
-    uint8_t fp_bits, size_t bucket_size, size_t max_kicks)
-{
-    if (!ctx || fp_bits == 0 || fp_bits > 32 || bucket_size == 0
-        || max_kicks == 0)
-    {
-        return SM2_IC_ERR_PARAM;
-    }
-
-    ctx->filter.fp_bits = fp_bits;
-    ctx->filter.bucket_size = bucket_size;
-    ctx->filter.max_kicks = max_kicks;
-    return rebuild_filter(ctx);
 }
 
 sm2_ic_error_t sm2_revocation_apply_crl_delta(
     sm2_revocation_ctx_t *ctx, const sm2_crl_delta_t *delta, uint64_t now_ts)
 {
     if (!ctx || !delta)
+        return SM2_IC_ERR_PARAM;
+    if (delta->item_count > 0 && !delta->items)
         return SM2_IC_ERR_PARAM;
     if (delta->base_version != ctx->crl_version)
         return SM2_IC_ERR_VERIFY;
@@ -294,92 +223,15 @@ sm2_ic_error_t sm2_revocation_apply_crl_delta(
             sm2_ic_error_t ret = local_list_add(ctx, it->serial_number);
             if (ret != SM2_IC_SUCCESS)
                 return ret;
-
-            ret = cuckoo_insert(&ctx->filter, it->serial_number);
-            if (ret != SM2_IC_SUCCESS)
-            {
-                ret = rebuild_filter(ctx);
-                if (ret != SM2_IC_SUCCESS)
-                    return ret;
-            }
         }
         else
         {
             local_list_remove(ctx, it->serial_number);
-            if (!cuckoo_delete(&ctx->filter, it->serial_number))
-            {
-                sm2_ic_error_t ret = rebuild_filter(ctx);
-                if (ret != SM2_IC_SUCCESS)
-                    return ret;
-            }
         }
-
-        sm2_ic_error_t log_ret = sync_log_append(ctx, delta->base_version,
-            delta->new_version, now_ts, it->serial_number, it->revoked);
-        if (log_ret != SM2_IC_SUCCESS)
-            return log_ret;
     }
 
     ctx->crl_version = delta->new_version;
-    ctx->filter_expire_at = now_ts + ctx->filter_ttl_sec;
-    return SM2_IC_SUCCESS;
-}
-
-static sm2_ic_error_t query_online_ocsp(sm2_revocation_ctx_t *ctx,
-    uint64_t serial_number, uint64_t now_ts, sm2_rev_status_t *status,
-    sm2_rev_source_t *source)
-{
-    if (!ctx->ocsp_cfg.query_fn)
-        return SM2_IC_ERR_PARAM;
-
-    sm2_ocsp_cache_entry_t *cached = cache_find(ctx, serial_number);
-    if (cached && cached->expires_at >= now_ts)
-    {
-        *status = cached->status;
-        *source = SM2_REV_SOURCE_OCSP_CACHE;
-        return SM2_IC_SUCCESS;
-    }
-
-    sm2_ocsp_response_t resp;
-    memset(&resp, 0, sizeof(resp));
-    sm2_ic_error_t ret = SM2_IC_ERR_CRYPTO;
-
-    uint8_t tries
-        = ctx->ocsp_cfg.retry_count == 0 ? 1 : ctx->ocsp_cfg.retry_count;
-    for (uint8_t i = 0; i < tries; i++)
-    {
-        ret = ctx->ocsp_cfg.query_fn(ctx->ocsp_cfg.user_ctx, serial_number,
-            ctx->ocsp_cfg.timeout_ms, &resp);
-        if (ret == SM2_IC_SUCCESS)
-            break;
-    }
-
-    if (ret != SM2_IC_SUCCESS)
-        return ret;
-
-    uint64_t expires_at
-        = resp.next_update > now_ts ? resp.next_update : (now_ts + 30);
-    cache_put(ctx, serial_number, resp.status, expires_at);
-    *status = resp.status;
-    *source = SM2_REV_SOURCE_OCSP;
-    return SM2_IC_SUCCESS;
-}
-
-static sm2_ic_error_t query_local_filter(sm2_revocation_ctx_t *ctx,
-    uint64_t serial_number, uint64_t now_ts, sm2_rev_status_t *status,
-    sm2_rev_source_t *source)
-{
-    if (ctx->filter_expire_at < now_ts)
-    {
-        *status = SM2_REV_STATUS_UNKNOWN;
-        *source = SM2_REV_SOURCE_LOCAL_FILTER_STALE;
-        return SM2_IC_SUCCESS;
-    }
-
-    *status = cuckoo_contains(&ctx->filter, serial_number)
-        ? SM2_REV_STATUS_REVOKED
-        : SM2_REV_STATUS_GOOD;
-    *source = SM2_REV_SOURCE_LOCAL_FILTER;
+    ctx->root_valid_until = now_ts + ctx->root_valid_ttl_sec;
     return SM2_IC_SUCCESS;
 }
 
@@ -393,15 +245,10 @@ sm2_ic_error_t sm2_revocation_query(sm2_revocation_ctx_t *ctx,
     *status = SM2_REV_STATUS_UNKNOWN;
     *source = SM2_REV_SOURCE_NONE;
 
-    if (ctx->online_mode && ctx->ocsp_cfg.query_fn)
-    {
-        sm2_ic_error_t ret
-            = query_online_ocsp(ctx, serial_number, now_ts, status, source);
-        if (ret == SM2_IC_SUCCESS)
-            return SM2_IC_SUCCESS;
-    }
+    if (!ctx->merkle_query_fn)
+        return SM2_IC_ERR_VERIFY;
 
-    return query_local_filter(ctx, serial_number, now_ts, status, source);
+    return query_merkle_callback(ctx, serial_number, now_ts, status, source);
 }
 
 size_t sm2_revocation_local_count(const sm2_revocation_ctx_t *ctx)
@@ -412,4 +259,317 @@ size_t sm2_revocation_local_count(const sm2_revocation_ctx_t *ctx)
 uint64_t sm2_revocation_crl_version(const sm2_revocation_ctx_t *ctx)
 {
     return ctx ? ctx->crl_version : 0;
+}
+
+sm2_ic_error_t sm2_revocation_set_congestion_thresholds(
+    sm2_revocation_ctx_t *ctx, size_t busy_threshold, size_t overload_threshold)
+{
+    if (!ctx || busy_threshold == 0 || overload_threshold <= busy_threshold)
+        return SM2_IC_ERR_PARAM;
+
+    ctx->congestion_busy_threshold = busy_threshold;
+    ctx->congestion_overload_threshold = overload_threshold;
+    ctx->congestion_signal = calc_congestion_signal(ctx);
+    return SM2_IC_SUCCESS;
+}
+
+sm2_ic_error_t sm2_revocation_set_query_inflight(
+    sm2_revocation_ctx_t *ctx, size_t query_inflight)
+{
+    if (!ctx)
+        return SM2_IC_ERR_PARAM;
+
+    ctx->query_inflight = query_inflight;
+    ctx->congestion_signal = calc_congestion_signal(ctx);
+    return SM2_IC_SUCCESS;
+}
+
+sm2_rev_congestion_signal_t sm2_revocation_get_congestion_signal(
+    const sm2_revocation_ctx_t *ctx)
+{
+    return calc_congestion_signal(ctx);
+}
+
+sm2_ic_error_t sm2_revocation_set_clock_skew_tolerance(
+    sm2_revocation_ctx_t *ctx, uint64_t tolerance_sec)
+{
+    if (!ctx)
+        return SM2_IC_ERR_PARAM;
+
+    ctx->clock_skew_tolerance_sec = tolerance_sec;
+    return SM2_IC_SUCCESS;
+}
+
+sm2_ic_error_t sm2_revocation_route_select_node(
+    const sm2_rev_route_node_t *nodes, size_t node_count, uint64_t now_ts,
+    uint64_t random_nonce, size_t *selected_index)
+{
+    if (!nodes || node_count == 0 || !selected_index)
+        return SM2_IC_ERR_PARAM;
+
+    bool has_non_overload = false;
+    for (size_t i = 0; i < node_count; i++)
+    {
+        const sm2_rev_route_node_t *node = &nodes[i];
+        if (node->next_retry_ts > now_ts)
+            continue;
+        if (route_effective_weight(node, true) == 0)
+            continue;
+        if (node->congestion_signal != SM2_REV_CONGESTION_OVERLOAD)
+            has_non_overload = true;
+    }
+
+    uint64_t total_weight = 0;
+    for (size_t i = 0; i < node_count; i++)
+    {
+        const sm2_rev_route_node_t *node = &nodes[i];
+        if (node->next_retry_ts > now_ts)
+            continue;
+
+        uint32_t w = route_effective_weight(node, !has_non_overload);
+        if (w == 0)
+            continue;
+
+        if (total_weight > UINT64_MAX - (uint64_t)w)
+            total_weight = UINT64_MAX;
+        else
+            total_weight += (uint64_t)w;
+    }
+
+    if (total_weight == 0)
+        return SM2_IC_ERR_VERIFY;
+
+    uint64_t ticket = random_nonce % total_weight;
+    for (size_t i = 0; i < node_count; i++)
+    {
+        const sm2_rev_route_node_t *node = &nodes[i];
+        if (node->next_retry_ts > now_ts)
+            continue;
+
+        uint32_t w = route_effective_weight(node, !has_non_overload);
+        if (w == 0)
+            continue;
+
+        if (ticket < (uint64_t)w)
+        {
+            *selected_index = i;
+            return SM2_IC_SUCCESS;
+        }
+        ticket -= (uint64_t)w;
+    }
+
+    return SM2_IC_ERR_VERIFY;
+}
+
+sm2_ic_error_t sm2_revocation_route_feedback(sm2_rev_route_node_t *node,
+    bool success, uint64_t now_ts, uint64_t base_backoff_sec,
+    uint64_t max_backoff_sec)
+{
+    if (!node || base_backoff_sec == 0 || max_backoff_sec < base_backoff_sec)
+        return SM2_IC_ERR_PARAM;
+
+    if (success)
+    {
+        node->fail_streak = 0;
+        node->next_retry_ts = now_ts;
+        return SM2_IC_SUCCESS;
+    }
+
+    if (node->fail_streak < UINT32_MAX)
+        node->fail_streak++;
+
+    uint32_t shift = node->fail_streak == 0 ? 0U : (node->fail_streak - 1U);
+    if (shift > 30U)
+        shift = 30U;
+
+    uint64_t backoff = base_backoff_sec;
+    if (shift > 0)
+    {
+        if (backoff > (UINT64_MAX >> shift))
+            backoff = UINT64_MAX;
+        else
+            backoff <<= shift;
+    }
+
+    if (backoff > max_backoff_sec)
+        backoff = max_backoff_sec;
+
+    if (now_ts > UINT64_MAX - backoff)
+        node->next_retry_ts = UINT64_MAX;
+    else
+        node->next_retry_ts = now_ts + backoff;
+
+    return SM2_IC_SUCCESS;
+}
+
+static bool quorum_vote_node_id_equal(
+    const sm2_rev_quorum_vote_t *a, const sm2_rev_quorum_vote_t *b)
+{
+    if (!a || !b)
+        return false;
+    if (a->node_id_len != b->node_id_len)
+        return false;
+    if (a->node_id_len == 0 || a->node_id_len > SM2_REV_SYNC_NODE_ID_MAX_LEN)
+        return false;
+
+    return memcmp(a->node_id, b->node_id, a->node_id_len) == 0;
+}
+
+sm2_ic_error_t sm2_revocation_trust_matrix_evaluate(
+    const sm2_rev_trust_matrix_input_t *input,
+    sm2_rev_trust_matrix_result_t *result)
+{
+    if (!input || !result)
+        return SM2_IC_ERR_PARAM;
+
+    memset(result, 0, sizeof(*result));
+
+    bool version_monotonic = input->remote_version >= input->local_version;
+    bool skew_ok = false;
+    uint64_t abs_skew = 0;
+    if (input->clock_skew_sec >= 0)
+        abs_skew = (uint64_t)input->clock_skew_sec;
+    else
+        abs_skew = (uint64_t)(-(input->clock_skew_sec + 1)) + 1U;
+
+    skew_ok = abs_skew <= input->clock_tolerance_sec;
+
+    result->hop_pass[SM2_REV_TRUST_HOP_CA_TO_NODE]
+        = input->ca_to_node_ok && version_monotonic;
+    result->hop_pass[SM2_REV_TRUST_HOP_NODE_SYNC] = input->node_sync_ok;
+    result->hop_pass[SM2_REV_TRUST_HOP_NODE_RESPONSE] = input->node_response_ok;
+    result->hop_pass[SM2_REV_TRUST_HOP_DEVICE_VERIFY] = input->device_verify_ok;
+    result->hop_pass[SM2_REV_TRUST_HOP_FALLBACK_PATH] = input->fallback_ok;
+    result->hop_pass[SM2_REV_TRUST_HOP_TIME_WINDOW] = skew_ok;
+
+    for (size_t i = 0; i < SM2_REV_TRUST_HOP_COUNT; i++)
+    {
+        if (!result->hop_pass[i])
+            result->fail_mask |= (uint32_t)(1U << i);
+    }
+
+    result->overall_pass = result->fail_mask == 0;
+    return SM2_IC_SUCCESS;
+}
+
+sm2_ic_error_t sm2_revocation_quorum_evaluate(
+    const sm2_rev_quorum_vote_t *votes, size_t vote_count, size_t threshold,
+    sm2_rev_quorum_result_t *result)
+{
+    if (!votes || vote_count == 0 || threshold == 0 || !result)
+        return SM2_IC_ERR_PARAM;
+    if (vote_count > SM2_REV_QUORUM_MAX_VOTES)
+        return SM2_IC_ERR_PARAM;
+
+    memset(result, 0, sizeof(*result));
+    result->threshold = threshold;
+    result->decided_status = SM2_REV_STATUS_UNKNOWN;
+
+    bool *accepted = (bool *)calloc(vote_count, sizeof(bool));
+    if (!accepted)
+        return SM2_IC_ERR_MEMORY;
+
+    bool has_selected_version = false;
+    uint64_t selected_version = 0;
+
+    for (size_t i = 0; i < vote_count; i++)
+    {
+        const sm2_rev_quorum_vote_t *v = &votes[i];
+        if (!v->proof_valid || v->node_id_len == 0
+            || v->node_id_len > SM2_REV_SYNC_NODE_ID_MAX_LEN)
+        {
+            continue;
+        }
+
+        bool dup = false;
+        for (size_t j = 0; j < i; j++)
+        {
+            if (!accepted[j])
+                continue;
+            if (quorum_vote_node_id_equal(v, &votes[j]))
+            {
+                dup = true;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+
+        accepted[i] = true;
+        result->unique_node_count++;
+
+        if (!has_selected_version || v->root_version > selected_version)
+        {
+            selected_version = v->root_version;
+            has_selected_version = true;
+        }
+    }
+
+    if (!has_selected_version)
+    {
+        free(accepted);
+        return SM2_IC_SUCCESS;
+    }
+
+    result->selected_root_version = selected_version;
+
+    bool hash_set = false;
+    for (size_t i = 0; i < vote_count; i++)
+    {
+        if (!accepted[i])
+            continue;
+
+        const sm2_rev_quorum_vote_t *v = &votes[i];
+        if (v->root_version != selected_version)
+        {
+            result->stale_vote_count++;
+            continue;
+        }
+
+        result->valid_vote_count++;
+        if (!hash_set)
+        {
+            memcpy(result->selected_root_hash, v->root_hash,
+                SM2_REV_SYNC_DIGEST_LEN);
+            hash_set = true;
+        }
+        else if (memcmp(result->selected_root_hash, v->root_hash,
+                     SM2_REV_SYNC_DIGEST_LEN)
+            != 0)
+        {
+            result->conflict_vote_count++;
+        }
+    }
+
+    if (result->conflict_vote_count > 0)
+    {
+        free(accepted);
+        return SM2_IC_ERR_VERIFY;
+    }
+
+    for (size_t i = 0; i < vote_count; i++)
+    {
+        if (!accepted[i])
+            continue;
+
+        const sm2_rev_quorum_vote_t *v = &votes[i];
+        if (v->root_version != selected_version)
+            continue;
+
+        if (v->status == SM2_REV_STATUS_REVOKED)
+            result->revoked_votes++;
+        else if (v->status == SM2_REV_STATUS_GOOD)
+            result->good_votes++;
+        else
+            result->unknown_votes++;
+    }
+
+    result->quorum_met = result->valid_vote_count >= threshold;
+    if (result->revoked_votes >= threshold)
+        result->decided_status = SM2_REV_STATUS_REVOKED;
+    else if (result->good_votes >= threshold)
+        result->decided_status = SM2_REV_STATUS_GOOD;
+
+    free(accepted);
+    return SM2_IC_SUCCESS;
 }

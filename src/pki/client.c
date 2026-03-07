@@ -9,6 +9,19 @@
 #include "sm2_secure_mem.h"
 #include <string.h>
 
+static sm2_ic_error_t pki_client_revocation_bridge(
+    const sm2_implicit_cert_t *cert, uint64_t now_ts, void *user_ctx,
+    sm2_rev_status_t *status)
+{
+    if (!cert || !user_ctx || !status)
+        return SM2_IC_ERR_PARAM;
+
+    sm2_revocation_ctx_t *rev_ctx = (sm2_revocation_ctx_t *)user_ctx;
+    sm2_rev_source_t source = SM2_REV_SOURCE_NONE;
+    return sm2_revocation_query(
+        rev_ctx, cert->serial_number, now_ts, status, &source);
+}
+
 sm2_pki_error_t sm2_pki_client_init(sm2_pki_client_ctx_t *ctx,
     const sm2_ec_point_t *default_ca_public_key, sm2_revocation_ctx_t *rev_ctx)
 {
@@ -29,6 +42,11 @@ sm2_pki_error_t sm2_pki_client_init(sm2_pki_client_ctx_t *ctx,
     }
 
     ctx->rev_ctx = rev_ctx;
+    if (rev_ctx)
+    {
+        ctx->revocation_query_fn = pki_client_revocation_bridge;
+        ctx->revocation_query_user_ctx = rev_ctx;
+    }
     ctx->initialized = true;
     return SM2_PKI_SUCCESS;
 }
@@ -48,6 +66,16 @@ sm2_pki_error_t sm2_pki_client_add_trusted_ca(
         return SM2_PKI_ERR_PARAM;
     return sm2_pki_error_from_ic(
         sm2_auth_trust_store_add_ca(&ctx->trust_store, ca_public_key));
+}
+
+sm2_pki_error_t sm2_pki_client_set_revocation_query(sm2_pki_client_ctx_t *ctx,
+    sm2_auth_revocation_query_fn query_fn, void *user_ctx)
+{
+    if (!ctx || !ctx->initialized)
+        return SM2_PKI_ERR_PARAM;
+    ctx->revocation_query_fn = query_fn;
+    ctx->revocation_query_user_ctx = user_ctx;
+    return SM2_PKI_SUCCESS;
 }
 
 sm2_pki_error_t sm2_pki_client_import_cert(sm2_pki_client_ctx_t *ctx,
@@ -137,8 +165,24 @@ sm2_pki_error_t sm2_pki_verify(sm2_pki_client_ctx_t *ctx,
 {
     if (!ctx || !ctx->initialized || !request)
         return SM2_PKI_ERR_PARAM;
+
+    sm2_auth_request_t req = *request;
+    req.lightweight_mode = true;
+
+    if (!req.revocation_query_fn && ctx->revocation_query_fn)
+
+    {
+
+        req.revocation_query_fn = ctx->revocation_query_fn;
+
+        req.revocation_query_user_ctx = ctx->revocation_query_user_ctx;
+    }
+
+    if (!req.revocation_query_fn)
+        return SM2_PKI_ERR_VERIFY;
+
     return sm2_pki_error_from_ic(sm2_auth_authenticate_request(
-        request, &ctx->trust_store, ctx->rev_ctx, now_ts, matched_ca_index));
+        &req, &ctx->trust_store, NULL, now_ts, matched_ca_index));
 }
 
 sm2_pki_error_t sm2_pki_batch_verify(

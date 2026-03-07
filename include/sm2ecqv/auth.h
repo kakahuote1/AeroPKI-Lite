@@ -10,6 +10,9 @@ typedef sm2_auth_request_t SM2_AUTH_REQUEST;
 typedef sm2_auth_verify_item_t SM2_AUTH_VERIFY_ITEM;
 typedef sm2_auth_trust_store_t SM2_AUTH_TRUST_STORE;
 typedef sm2_auth_precompute_pool_t SM2_AUTH_PRECOMPUTE_POOL;
+typedef sm2_auth_revocation_query_fn SM2_AUTH_REVOCATION_QUERY_FN;
+typedef sm2_auth_revocation_policy_t SM2_AUTH_REVOCATION_POLICY;
+typedef sm2_auth_aead_mode_t SM2_AUTH_AEAD_MODE;
 typedef sm2_ic_error_t SM2_AUTH_ERROR;
 
 #define SM2_AUTH_SUCCESS SM2_IC_SUCCESS
@@ -28,8 +31,15 @@ typedef sm2_ic_error_t SM2_AUTH_ERROR;
 #define SM2_AUTH_sign_with_pool sm2_auth_sign_with_pool
 #define SM2_AUTH_mutual_auth_and_key_agreement                                 \
     sm2_auth_mutual_auth_and_key_agreement
+#define SM2_AUTH_mutual_auth_and_key_agreement_v2                              \
+    sm2_auth_mutual_auth_and_key_agreement_v2
+#define SM2_AUTH_generate_ephemeral_keypair sm2_auth_generate_ephemeral_keypair
 #define SM2_AUTH_derive_session_key sm2_auth_derive_session_key
+#define SM2_AUTH_derive_session_key_ephemeral                                  \
+    sm2_auth_derive_session_key_ephemeral
 #define SM2_AUTH_sm4_encrypt sm2_auth_sm4_encrypt
 #define SM2_AUTH_sm4_decrypt sm2_auth_sm4_decrypt
+#define SM2_AUTH_sm4_aead_encrypt sm2_auth_sm4_aead_encrypt
+#define SM2_AUTH_sm4_aead_decrypt sm2_auth_sm4_aead_decrypt
 
 #endif

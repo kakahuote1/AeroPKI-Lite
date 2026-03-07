@@ -17,6 +17,5 @@ typedef sm2_pki_error_t SM2_PKI_ERROR;
 #define SM2_PKI_cert_issue sm2_pki_cert_issue
 #define SM2_PKI_service_revoke_cert sm2_pki_service_revoke_cert
 #define SM2_PKI_revoke_check sm2_pki_revoke_check
-#define SM2_PKI_service_build_ocsp_cfg sm2_pki_service_build_ocsp_cfg
 
 #endif
