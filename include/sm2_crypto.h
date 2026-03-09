@@ -1,8 +1,8 @@
-﻿/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-License-Identifier: Apache-2.0 */
 
 /**
  * @file sm2_crypto.h
- * @brief Phase4 crypto component wrappers and unified error mapping.
+ * @brief Crypto wrappers and unified PKI error mapping.
  */
 
 #ifndef SM2_CRYPTO_H
@@ -45,21 +45,13 @@ extern "C"
         const uint8_t *message, size_t message_len,
         const sm2_auth_signature_t *signature);
 
-    sm2_pki_error_t sm2_pki_sm4_encrypt(const uint8_t key[16],
-        const uint8_t iv[16], const uint8_t *plaintext, size_t plaintext_len,
-        uint8_t *ciphertext, size_t *ciphertext_len);
-
-    sm2_pki_error_t sm2_pki_sm4_decrypt(const uint8_t key[16],
-        const uint8_t iv[16], const uint8_t *ciphertext, size_t ciphertext_len,
-        uint8_t *plaintext, size_t *plaintext_len);
-
-    sm2_pki_error_t sm2_pki_sm4_aead_encrypt(sm2_pki_aead_mode_t mode,
+    sm2_pki_error_t sm2_pki_aead_encrypt(sm2_pki_aead_mode_t mode,
         const uint8_t key[16], const uint8_t *iv, size_t iv_len,
         const uint8_t *aad, size_t aad_len, const uint8_t *plaintext,
         size_t plaintext_len, uint8_t *ciphertext, size_t *ciphertext_len,
         uint8_t *tag, size_t *tag_len);
 
-    sm2_pki_error_t sm2_pki_sm4_aead_decrypt(sm2_pki_aead_mode_t mode,
+    sm2_pki_error_t sm2_pki_aead_decrypt(sm2_pki_aead_mode_t mode,
         const uint8_t key[16], const uint8_t *iv, size_t iv_len,
         const uint8_t *aad, size_t aad_len, const uint8_t *ciphertext,
         size_t ciphertext_len, const uint8_t *tag, size_t tag_len,

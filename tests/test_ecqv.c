@@ -55,16 +55,6 @@ static int test_cbor_read_head(const uint8_t *buf, size_t len, size_t *offset,
     return 0;
 }
 
-void test_setup_ca()
-{
-    TEST_ASSERT(sm2_ic_generate_random(g_ca_priv.d, 32) == SM2_IC_SUCCESS,
-        "CA KeyGen Failed");
-    TEST_ASSERT(sm2_ic_sm2_point_mult(&g_ca_pub, g_ca_priv.d, 32, NULL)
-            == SM2_IC_SUCCESS,
-        "CA PubKey Failed");
-    g_ca_initialized = 1;
-}
-
 static void test_setup_ca_case()
 {
     test_setup_ca();
@@ -90,8 +80,8 @@ static void test_full_lifecycle()
                     &req, sub_id, strlen((char *)sub_id), usage, &temp_priv)
             == SM2_IC_SUCCESS,
         "Req Create");
-    TEST_ASSERT(sm2_ic_ca_generate_cert(&res, &req, iss_id,
-                    strlen((char *)iss_id), &g_ca_priv, &g_ca_pub)
+    TEST_ASSERT(test_issue_cert(&res, &req, iss_id, strlen((char *)iss_id),
+                    &g_ca_priv, &g_ca_pub)
             == SM2_IC_SUCCESS,
         "Cert Issue");
     TEST_ASSERT(
@@ -118,11 +108,18 @@ static void test_tampered_cert()
     sm2_private_key_t user_priv;
     sm2_ec_point_t user_pub;
 
-    sm2_ic_create_cert_request(
-        &req, (uint8_t *)"DEV", 3, SM2_KU_DIGITAL_SIGNATURE, &temp_priv);
-    sm2_ic_ca_generate_cert(
-        &res, &req, (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub);
-    sm2_ic_reconstruct_keys(&user_priv, &user_pub, &res, &temp_priv, &g_ca_pub);
+    TEST_ASSERT(sm2_ic_create_cert_request(&req, (uint8_t *)"DEV", 3,
+                    SM2_KU_DIGITAL_SIGNATURE, &temp_priv)
+            == SM2_IC_SUCCESS,
+        "Create Tamper Request");
+    TEST_ASSERT(
+        test_issue_cert(&res, &req, (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Issue Tamper Cert");
+    TEST_ASSERT(sm2_ic_reconstruct_keys(
+                    &user_priv, &user_pub, &res, &temp_priv, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Reconstruct Tamper Keys");
 
     res.cert.serial_number++;
     TEST_ASSERT(
@@ -183,6 +180,21 @@ static void test_cbor_robustness()
             "Type Mismatch Must Fail");
     }
 
+    /* malformed #2b: unsupported certificate type value */
+    memcpy(bad_type, buf, len);
+    off = 0;
+    arr_len = 0;
+    TEST_ASSERT(test_cbor_read_head(bad_type, len, &off, 4, &arr_len) == 1,
+        "Read Array Head Type Value");
+    TEST_ASSERT(off < len, "Type Value Present");
+    bad_type[off] = 0x02; /* uint(2), not implicit cert type */
+    {
+        sm2_implicit_cert_t out;
+        TEST_ASSERT(
+            sm2_ic_cbor_decode_cert(&out, bad_type, len) == SM2_IC_ERR_CBOR,
+            "Unsupported Cert Type Must Fail");
+    }
+
     /* malformed #3: subject_id claimed length > 256 */
     uint8_t oversize[512];
     size_t o = 0;
@@ -230,10 +242,25 @@ static void test_cbor_key_usage_overflow_rejected()
     TEST_ASSERT(sm2_ic_cbor_decode_cert(&out, bad, o) == SM2_IC_ERR_CBOR,
         "Reject key_usage overflow");
 
+    o = 0;
+    bad[o++] = 0x85; /* array(5): type, serial, field_mask, key_usage, V */
+    bad[o++] = 0x01; /* type implicit */
+    bad[o++] = 0x01; /* serial */
+    bad[o++] = 0x10; /* field_mask = SM2_IC_FIELD_KEY_USAGE */
+    bad[o++] = 0x18; /* uint8 */
+    bad[o++] = 0x80; /* invalid usage bit outside whitelist */
+    bad[o++] = 0x58;
+    bad[o++] = 0x21; /* public_recon_key len=33 */
+    memset(bad + o, 0x44, 33);
+    o += 33;
+
+    TEST_ASSERT(sm2_ic_cbor_decode_cert(&out, bad, o) == SM2_IC_ERR_CBOR,
+        "Reject key_usage invalid bits");
+
     TEST_PASS();
 }
 
-static void test_field_mask_template()
+static void test_issue_ctx_secure_default_only()
 {
     if (!g_ca_initialized)
         test_setup_ca();
@@ -242,54 +269,41 @@ static void test_field_mask_template()
     sm2_ic_issue_ctx_init(&issue_ctx);
     const uint16_t custom_mask
         = SM2_IC_FIELD_SUBJECT_ID | SM2_IC_FIELD_KEY_USAGE;
+    TEST_ASSERT(
+        sm2_ic_issue_ctx_get_field_mask(&issue_ctx) == SM2_IC_FIELD_MASK_ALL,
+        "Default Secure Mask");
     TEST_ASSERT(sm2_ic_issue_ctx_set_field_mask(&issue_ctx, custom_mask)
-            == SM2_IC_SUCCESS,
-        "Set Custom Mask");
+            == SM2_IC_ERR_PARAM,
+        "Reject Custom Mask");
+    TEST_ASSERT(
+        sm2_ic_issue_ctx_get_field_mask(&issue_ctx) == SM2_IC_FIELD_MASK_ALL,
+        "Mask Remains Secure Default");
 
     sm2_ic_cert_request_t req;
     sm2_private_key_t temp_priv;
     sm2_ic_cert_result_t res;
-    sm2_private_key_t user_priv;
-    sm2_ec_point_t user_pub;
-    uint8_t buf[512];
-    size_t len = sizeof(buf);
 
     TEST_ASSERT(sm2_ic_create_cert_request(&req, (uint8_t *)"MASK_CASE", 9,
                     SM2_KU_DIGITAL_SIGNATURE, &temp_priv)
             == SM2_IC_SUCCESS,
         "Req Create");
-    TEST_ASSERT(sm2_ic_ca_generate_cert_with_ctx(&res, &req,
-                    (uint8_t *)"CA_MASK", 7, &g_ca_priv, &g_ca_pub, &issue_ctx)
+    TEST_ASSERT(test_issue_cert_with_ctx(&res, &req, (uint8_t *)"CA_MASK", 7,
+                    &g_ca_priv, &g_ca_pub, &issue_ctx)
             == SM2_IC_SUCCESS,
-        "Cert Issue");
-    TEST_ASSERT(res.cert.field_mask == custom_mask, "Mask Applied");
-    TEST_ASSERT(res.cert.subject_id_len > 0, "Subject Kept");
-    TEST_ASSERT(res.cert.issuer_id_len == 0, "Issuer Removed");
-    TEST_ASSERT(res.cert.valid_from == 0, "ValidFrom Removed");
-    TEST_ASSERT(res.cert.valid_duration == 0, "Duration Removed");
-    TEST_ASSERT(res.cert.key_usage == SM2_KU_DIGITAL_SIGNATURE, "Usage Kept");
-
-    TEST_ASSERT(sm2_ic_cbor_encode_cert(buf, &len, &res.cert) == SM2_IC_SUCCESS,
-        "CBOR Encode");
-    sm2_implicit_cert_t decoded;
-    TEST_ASSERT(sm2_ic_cbor_decode_cert(&decoded, buf, len) == SM2_IC_SUCCESS,
-        "CBOR Decode");
-    TEST_ASSERT(decoded.field_mask == custom_mask, "Mask Decode");
-    TEST_ASSERT(decoded.issuer_id_len == 0, "Issuer Decode Removed");
-    TEST_ASSERT(decoded.valid_from == 0, "ValidFrom Decode Removed");
-
-    TEST_ASSERT(sm2_ic_reconstruct_keys(
-                    &user_priv, &user_pub, &res, &temp_priv, &g_ca_pub)
-            == SM2_IC_SUCCESS,
-        "Key Recon");
+        "Issue With Secure Default");
     TEST_ASSERT(
-        sm2_ic_verify_cert(&res.cert, &user_pub, &g_ca_pub) == SM2_IC_SUCCESS,
-        "Cert Verify");
+        res.cert.field_mask == SM2_IC_FIELD_MASK_ALL, "Mask Stays Secure");
+    TEST_ASSERT(res.cert.subject_id_len > 0, "Subject Present");
+    TEST_ASSERT(res.cert.issuer_id_len > 0, "Issuer Present");
+    TEST_ASSERT(res.cert.valid_from > 0, "ValidFrom Present");
+    TEST_ASSERT(res.cert.valid_duration > 0, "Duration Present");
+    TEST_ASSERT(
+        res.cert.key_usage == SM2_KU_DIGITAL_SIGNATURE, "Usage Present");
 
     TEST_PASS();
 }
 
-static void test_cert_size_reduction_by_mask()
+static void test_ca_public_key_consistency_enforced()
 {
     if (!g_ca_initialized)
         test_setup_ca();
@@ -298,43 +312,38 @@ static void test_cert_size_reduction_by_mask()
     sm2_ic_issue_ctx_init(&issue_ctx);
     sm2_ic_cert_request_t req;
     sm2_private_key_t temp_priv;
-    sm2_ic_cert_result_t full_cert;
-    sm2_ic_cert_result_t slim_cert;
-    uint8_t buf[1024];
-    size_t full_len = sizeof(buf);
-    size_t slim_len = sizeof(buf);
+    sm2_ic_cert_result_t cert_res;
+    sm2_private_key_t user_priv;
+    sm2_ec_point_t user_pub;
+    sm2_private_key_t wrong_ca_priv;
+    sm2_ec_point_t wrong_ca_pub;
 
     TEST_ASSERT(sm2_ic_create_cert_request(&req, (uint8_t *)"SIZE_CASE", 9,
                     SM2_KU_DIGITAL_SIGNATURE, &temp_priv)
             == SM2_IC_SUCCESS,
         "Req Create");
+    TEST_ASSERT(test_generate_sm2_keypair(&wrong_ca_priv, &wrong_ca_pub),
+        "Wrong CA Keypair");
 
-    TEST_ASSERT(
-        sm2_ic_issue_ctx_set_field_mask(&issue_ctx, SM2_IC_FIELD_MASK_ALL)
+    TEST_ASSERT(test_issue_cert_with_ctx(&cert_res, &req, (uint8_t *)"CA", 2,
+                    &g_ca_priv, &wrong_ca_pub, &issue_ctx)
+            == SM2_IC_ERR_VERIFY,
+        "Reject Issuer Public Key Mismatch");
+    TEST_ASSERT(test_issue_cert_with_ctx(&cert_res, &req, (uint8_t *)"CA", 2,
+                    &g_ca_priv, &g_ca_pub, &issue_ctx)
             == SM2_IC_SUCCESS,
-        "Set Full Mask");
-    TEST_ASSERT(sm2_ic_ca_generate_cert_with_ctx(&full_cert, &req,
-                    (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub, &issue_ctx)
+        "Issue With Matched CA");
+    TEST_ASSERT(sm2_ic_reconstruct_keys(
+                    &user_priv, &user_pub, &cert_res, &temp_priv, &wrong_ca_pub)
+            == SM2_IC_ERR_VERIFY,
+        "Reject Reconstruct With Wrong CA");
+    TEST_ASSERT(sm2_ic_reconstruct_keys(
+                    &user_priv, &user_pub, &cert_res, &temp_priv, &g_ca_pub)
             == SM2_IC_SUCCESS,
-        "Issue Full");
-    TEST_ASSERT(sm2_ic_cbor_encode_cert(buf, &full_len, &full_cert.cert)
+        "Reconstruct With Matched CA");
+    TEST_ASSERT(sm2_ic_verify_cert(&cert_res.cert, &user_pub, &g_ca_pub)
             == SM2_IC_SUCCESS,
-        "Encode Full");
-
-    TEST_ASSERT(
-        sm2_ic_issue_ctx_set_field_mask(&issue_ctx, SM2_IC_FIELD_SUBJECT_ID)
-            == SM2_IC_SUCCESS,
-        "Set Slim Mask");
-    TEST_ASSERT(sm2_ic_ca_generate_cert_with_ctx(&slim_cert, &req,
-                    (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub, &issue_ctx)
-            == SM2_IC_SUCCESS,
-        "Issue Slim");
-    TEST_ASSERT(sm2_ic_cbor_encode_cert(buf, &slim_len, &slim_cert.cert)
-            == SM2_IC_SUCCESS,
-        "Encode Slim");
-
-    printf("   [SIZE] full=%zu bytes, slim=%zu bytes\n", full_len, slim_len);
-    TEST_ASSERT(slim_len < full_len, "Slim Must Be Smaller");
+        "Verify With Matched CA");
 
     TEST_PASS();
 }
@@ -344,6 +353,7 @@ static void test_issue_ctx_accessor_and_param_defense()
     sm2_ic_issue_ctx_t issue_ctx;
     sm2_ic_cert_request_t req;
     sm2_private_key_t temp_priv;
+    sm2_ic_cert_result_t cert_res;
     uint8_t subject[] = "CTX_CASE";
 
     TEST_ASSERT(sm2_ic_issue_ctx_get_field_mask(NULL) == SM2_IC_FIELD_MASK_ALL,
@@ -357,10 +367,14 @@ static void test_issue_ctx_accessor_and_param_defense()
     uint16_t custom_mask
         = (uint16_t)(SM2_IC_FIELD_SUBJECT_ID | SM2_IC_FIELD_KEY_USAGE);
     TEST_ASSERT(sm2_ic_issue_ctx_set_field_mask(&issue_ctx, custom_mask)
-            == SM2_IC_SUCCESS,
-        "Set Mask Custom");
-    TEST_ASSERT(sm2_ic_issue_ctx_get_field_mask(&issue_ctx) == custom_mask,
-        "Get Mask Custom");
+            == SM2_IC_ERR_PARAM,
+        "Reject Custom Mask");
+    TEST_ASSERT(
+        sm2_ic_issue_ctx_set_field_mask(&issue_ctx, 0) == SM2_IC_ERR_PARAM,
+        "Reject Zero Mask");
+    TEST_ASSERT(
+        sm2_ic_issue_ctx_get_field_mask(&issue_ctx) == SM2_IC_FIELD_MASK_ALL,
+        "Mask Stays Secure");
 
     TEST_ASSERT(
         sm2_ic_issue_ctx_set_field_mask(&issue_ctx, 0xFFFF) == SM2_IC_ERR_PARAM,
@@ -368,6 +382,24 @@ static void test_issue_ctx_accessor_and_param_defense()
     TEST_ASSERT(
         sm2_ic_issue_ctx_set_field_mask(NULL, custom_mask) == SM2_IC_ERR_PARAM,
         "Set Mask NULL");
+
+    issue_ctx.field_mask = custom_mask;
+    TEST_ASSERT(sm2_ic_create_cert_request(&req, subject, sizeof(subject) - 1,
+                    SM2_KU_DIGITAL_SIGNATURE, &temp_priv)
+            == SM2_IC_SUCCESS,
+        "Create Req");
+    TEST_ASSERT(sm2_ic_create_cert_request(
+                    &req, subject, sizeof(subject) - 1, 0, &temp_priv)
+            == SM2_IC_ERR_PARAM,
+        "Reject Zero Key Usage");
+    TEST_ASSERT(sm2_ic_create_cert_request(
+                    &req, subject, sizeof(subject) - 1, 0x80, &temp_priv)
+            == SM2_IC_ERR_PARAM,
+        "Reject Invalid Key Usage Bits");
+    TEST_ASSERT(test_issue_cert_with_ctx(&cert_res, &req, (uint8_t *)"CA", 2,
+                    &g_ca_priv, &g_ca_pub, &issue_ctx)
+            == SM2_IC_ERR_PARAM,
+        "Reject Manually Tampered Issue Ctx");
 
     TEST_ASSERT(sm2_ic_create_cert_request(NULL, subject, sizeof(subject) - 1,
                     SM2_KU_DIGITAL_SIGNATURE, &temp_priv)
@@ -385,7 +417,54 @@ static void test_issue_ctx_accessor_and_param_defense()
     TEST_PASS();
 }
 
-static void test_mask_zero_and_subject_id_boundary()
+static void test_verify_rejects_non_implicit_type_and_invalid_usage()
+{
+    if (!g_ca_initialized)
+        test_setup_ca();
+
+    sm2_ic_cert_request_t req;
+    sm2_private_key_t temp_priv;
+    sm2_ic_cert_result_t cert_res;
+    sm2_private_key_t user_priv;
+    sm2_ec_point_t user_pub;
+    uint8_t encoded[1024];
+    size_t encoded_len = sizeof(encoded);
+
+    TEST_ASSERT(sm2_ic_create_cert_request(&req, (uint8_t *)"VERIFY_CONTRACT",
+                    15, SM2_KU_DIGITAL_SIGNATURE, &temp_priv)
+            == SM2_IC_SUCCESS,
+        "Create Contract Req");
+    TEST_ASSERT(test_issue_cert(
+                    &cert_res, &req, (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Issue Contract Cert");
+    TEST_ASSERT(sm2_ic_reconstruct_keys(
+                    &user_priv, &user_pub, &cert_res, &temp_priv, &g_ca_pub)
+            == SM2_IC_SUCCESS,
+        "Reconstruct Contract Keys");
+
+    cert_res.cert.type = 0x02;
+    TEST_ASSERT(sm2_ic_verify_cert(&cert_res.cert, &user_pub, &g_ca_pub)
+            == SM2_IC_ERR_VERIFY,
+        "Reject Non Implicit Cert Type");
+    TEST_ASSERT(sm2_ic_cbor_encode_cert(encoded, &encoded_len, &cert_res.cert)
+            == SM2_IC_ERR_PARAM,
+        "Reject Encode Non Implicit Cert Type");
+
+    cert_res.cert.type = SM2_CERT_TYPE_IMPLICIT;
+    cert_res.cert.key_usage = 0x80;
+    TEST_ASSERT(sm2_ic_verify_cert(&cert_res.cert, &user_pub, &g_ca_pub)
+            == SM2_IC_ERR_VERIFY,
+        "Reject Invalid Key Usage In Verify");
+    encoded_len = sizeof(encoded);
+    TEST_ASSERT(sm2_ic_cbor_encode_cert(encoded, &encoded_len, &cert_res.cert)
+            == SM2_IC_ERR_PARAM,
+        "Reject Encode Invalid Key Usage");
+
+    TEST_PASS();
+}
+
+static void test_subject_id_boundary_under_secure_mask()
 {
     if (!g_ca_initialized)
         test_setup_ca();
@@ -403,25 +482,24 @@ static void test_mask_zero_and_subject_id_boundary()
     size_t cbor_len = sizeof(cbor);
 
     sm2_ic_issue_ctx_init(&issue_ctx);
-    TEST_ASSERT(
-        sm2_ic_issue_ctx_set_field_mask(&issue_ctx, 0) == SM2_IC_SUCCESS,
-        "Set Zero Mask");
-
     TEST_ASSERT(sm2_ic_create_cert_request(&req, subject_id, sizeof(subject_id),
                     SM2_KU_DIGITAL_SIGNATURE, &temp_priv)
             == SM2_IC_SUCCESS,
         "Create Req Subject 256");
-    TEST_ASSERT(sm2_ic_ca_generate_cert_with_ctx(&cert_res, &req,
-                    (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub, &issue_ctx)
+    TEST_ASSERT(test_issue_cert_with_ctx(&cert_res, &req, (uint8_t *)"CA", 2,
+                    &g_ca_priv, &g_ca_pub, &issue_ctx)
             == SM2_IC_SUCCESS,
-        "Issue Zero Mask Cert");
+        "Issue Secure Mask Cert");
 
-    TEST_ASSERT(cert_res.cert.field_mask == 0, "Mask Zero Applied");
-    TEST_ASSERT(cert_res.cert.subject_id_len == 0, "Subject Removed");
-    TEST_ASSERT(cert_res.cert.issuer_id_len == 0, "Issuer Removed");
-    TEST_ASSERT(cert_res.cert.valid_from == 0, "ValidFrom Removed");
-    TEST_ASSERT(cert_res.cert.valid_duration == 0, "Duration Removed");
-    TEST_ASSERT(cert_res.cert.key_usage == 0, "Usage Removed");
+    TEST_ASSERT(cert_res.cert.field_mask == SM2_IC_FIELD_MASK_ALL,
+        "Secure Mask Applied");
+    TEST_ASSERT(cert_res.cert.subject_id_len == sizeof(subject_id),
+        "Subject Preserved");
+    TEST_ASSERT(cert_res.cert.issuer_id_len > 0, "Issuer Present");
+    TEST_ASSERT(cert_res.cert.valid_from > 0, "ValidFrom Present");
+    TEST_ASSERT(cert_res.cert.valid_duration > 0, "Duration Present");
+    TEST_ASSERT(
+        cert_res.cert.key_usage == SM2_KU_DIGITAL_SIGNATURE, "Usage Present");
 
     TEST_ASSERT(sm2_ic_cbor_encode_cert(cbor, &cbor_len, &cert_res.cert)
             == SM2_IC_SUCCESS,
@@ -429,16 +507,17 @@ static void test_mask_zero_and_subject_id_boundary()
     sm2_implicit_cert_t decoded;
     TEST_ASSERT(
         sm2_ic_cbor_decode_cert(&decoded, cbor, cbor_len) == SM2_IC_SUCCESS,
-        "Decode Zero Mask Cert");
-    TEST_ASSERT(decoded.field_mask == 0, "Decode Mask Zero");
+        "Decode Secure Mask Cert");
+    TEST_ASSERT(
+        decoded.field_mask == SM2_IC_FIELD_MASK_ALL, "Decode Secure Mask");
 
     TEST_ASSERT(sm2_ic_reconstruct_keys(
                     &user_priv, &user_pub, &cert_res, &temp_priv, &g_ca_pub)
             == SM2_IC_SUCCESS,
-        "Reconstruct Zero Mask Cert");
+        "Reconstruct Secure Mask Cert");
     TEST_ASSERT(sm2_ic_verify_cert(&cert_res.cert, &user_pub, &g_ca_pub)
             == SM2_IC_SUCCESS,
-        "Verify Zero Mask Cert");
+        "Verify Secure Mask Cert");
 
     TEST_PASS();
 }
@@ -454,19 +533,17 @@ static void test_performance()
     sm2_ic_create_cert_request(
         &req, (uint8_t *)"PERF", 4, SM2_KU_DIGITAL_SIGNATURE, &temp_priv);
 
-    int iterations = 1000;
-    clock_t start = clock();
+    const int iterations = 1000;
+    double start = now_ms_highres();
 
     for (int i = 0; i < iterations; i++)
     {
-        sm2_ic_ca_generate_cert(
-            &res, &req, (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub);
+        test_issue_cert(&res, &req, (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub);
     }
 
-    double avg_time
-        = ((double)(clock() - start)) / CLOCKS_PER_SEC * 1000.0 / iterations;
+    double avg_time = (now_ms_highres() - start) / iterations;
     printf(
-        "   [PERF] Avg Issuance Time: %.3f ms (N=%d)\n", avg_time, iterations);
+        "   [BENCH] Avg Issuance Time: %.3f ms (N=%d)\n", avg_time, iterations);
     TEST_PASS();
 }
 
@@ -490,7 +567,7 @@ static void test_chain_success_rate()
                 SM2_KU_DIGITAL_SIGNATURE, &temp_priv)
             != SM2_IC_SUCCESS)
             continue;
-        if (sm2_ic_ca_generate_cert(
+        if (test_issue_cert(
                 &res, &req, (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub)
             != SM2_IC_SUCCESS)
             continue;
@@ -529,7 +606,7 @@ static void test_serial_unpredictable_and_low_conflict()
 
     for (size_t i = 0; i < n; i++)
     {
-        TEST_ASSERT(sm2_ic_ca_generate_cert(
+        TEST_ASSERT(test_issue_cert(
                         &res, &req, (uint8_t *)"CA", 2, &g_ca_priv, &g_ca_pub)
                 == SM2_IC_SUCCESS,
             "Issue Cert");
@@ -556,11 +633,13 @@ void run_test_ecqv_suite(void)
     RUN_TEST(test_tampered_cert);
     RUN_TEST(test_cbor_robustness);
     RUN_TEST(test_cbor_key_usage_overflow_rejected);
-    RUN_TEST(test_field_mask_template);
-    RUN_TEST(test_cert_size_reduction_by_mask);
+    RUN_TEST(test_issue_ctx_secure_default_only);
+    RUN_TEST(test_ca_public_key_consistency_enforced);
     RUN_TEST(test_issue_ctx_accessor_and_param_defense);
-    RUN_TEST(test_mask_zero_and_subject_id_boundary);
-    RUN_TEST(test_performance);
+    RUN_TEST(test_verify_rejects_non_implicit_type_and_invalid_usage);
+    RUN_TEST(test_subject_id_boundary_under_secure_mask);
     RUN_TEST(test_chain_success_rate);
     RUN_TEST(test_serial_unpredictable_and_low_conflict);
+    if (test_benchmarks_enabled())
+        RUN_TEST(test_performance);
 }

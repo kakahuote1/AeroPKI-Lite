@@ -1,11 +1,22 @@
-﻿/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-License-Identifier: Apache-2.0 */
 
 /**
  * @file merkle.c
- * @brief Core Merkle hash tree: build, prove, verify (member & non-member).
+ * @brief Core Merkle hash tree: build, prove, verify (member & absence).
  */
 
 #include "merkle_internal.h"
+
+static void rev_tree_reset(sm2_rev_tree_t *tree)
+{
+    if (!tree)
+        return;
+
+    free(tree->serials);
+    free(tree->node_hashes);
+    memset(tree, 0, sizeof(*tree));
+}
+
 int merkle_cmp_u64(const void *a, const void *b)
 {
     uint64_t va = *(const uint64_t *)a;
@@ -49,18 +60,17 @@ sm2_ic_error_t merkle_hash_empty(uint8_t out_hash[SM2_REV_MERKLE_HASH_LEN])
     return sm2_ic_sm3_hash(&marker, 1, out_hash);
 }
 
-void sm2_revocation_merkle_cleanup(sm2_rev_merkle_tree_t *tree)
+void sm2_rev_tree_cleanup(sm2_rev_tree_t **tree)
 {
-    if (!tree)
+    if (!tree || !*tree)
         return;
-
-    free(tree->serials);
-    free(tree->node_hashes);
-    memset(tree, 0, sizeof(*tree));
+    rev_tree_reset(*tree);
+    free(*tree);
+    *tree = NULL;
 }
 
 sm2_ic_error_t merkle_calc_layout(
-    sm2_rev_merkle_tree_t *tree, size_t leaf_count, size_t *out_total_nodes)
+    sm2_rev_tree_t *tree, size_t leaf_count, size_t *out_total_nodes)
 {
     size_t level = 0;
     size_t n = leaf_count;
@@ -89,37 +99,44 @@ sm2_ic_error_t merkle_calc_layout(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_build(sm2_rev_merkle_tree_t *tree,
+sm2_ic_error_t sm2_rev_tree_build(sm2_rev_tree_t **tree,
     const uint64_t *revoked_serials, size_t revoked_count,
     uint64_t root_version)
 {
     if (!tree)
         return SM2_IC_ERR_PARAM;
+    if (!*tree)
+    {
+        *tree = (sm2_rev_tree_t *)calloc(1, sizeof(**tree));
+        if (!*tree)
+            return SM2_IC_ERR_MEMORY;
+    }
+    sm2_rev_tree_t *state = *tree;
     if (revoked_count > 0 && !revoked_serials)
         return SM2_IC_ERR_PARAM;
 
-    sm2_revocation_merkle_cleanup(tree);
+    rev_tree_reset(state);
 
-    tree->root_version = root_version;
+    state->root_version = root_version;
 
     if (revoked_count == 0)
     {
-        tree->leaf_count = 0;
-        tree->level_count = 1;
-        tree->level_sizes[0] = 1;
-        tree->level_offsets[0] = 0;
-        tree->node_hashes_len = SM2_REV_MERKLE_HASH_LEN;
-        tree->node_hashes = (uint8_t *)calloc(1, tree->node_hashes_len);
-        if (!tree->node_hashes)
+        state->leaf_count = 0;
+        state->level_count = 1;
+        state->level_sizes[0] = 1;
+        state->level_offsets[0] = 0;
+        state->node_hashes_len = SM2_REV_MERKLE_HASH_LEN;
+        state->node_hashes = (uint8_t *)calloc(1, state->node_hashes_len);
+        if (!state->node_hashes)
             return SM2_IC_ERR_MEMORY;
 
-        sm2_ic_error_t ret = merkle_hash_empty(tree->node_hashes);
+        sm2_ic_error_t ret = merkle_hash_empty(state->node_hashes);
         if (ret != SM2_IC_SUCCESS)
         {
-            sm2_revocation_merkle_cleanup(tree);
+            rev_tree_reset(state);
             return ret;
         }
-        memcpy(tree->root_hash, tree->node_hashes, SM2_REV_MERKLE_HASH_LEN);
+        memcpy(state->root_hash, state->node_hashes, SM2_REV_MERKLE_HASH_LEN);
         return SM2_IC_SUCCESS;
     }
 
@@ -136,57 +153,57 @@ sm2_ic_error_t sm2_revocation_merkle_build(sm2_rev_merkle_tree_t *tree,
             tmp[uniq_count++] = tmp[i];
     }
 
-    tree->serials = (uint64_t *)malloc(uniq_count * sizeof(uint64_t));
-    if (!tree->serials)
+    state->serials = (uint64_t *)malloc(uniq_count * sizeof(uint64_t));
+    if (!state->serials)
     {
         free(tmp);
         return SM2_IC_ERR_MEMORY;
     }
-    memcpy(tree->serials, tmp, uniq_count * sizeof(uint64_t));
+    memcpy(state->serials, tmp, uniq_count * sizeof(uint64_t));
     free(tmp);
-    tree->leaf_count = uniq_count;
+    state->leaf_count = uniq_count;
 
     size_t total_nodes = 0;
-    sm2_ic_error_t ret = merkle_calc_layout(tree, uniq_count, &total_nodes);
+    sm2_ic_error_t ret = merkle_calc_layout(state, uniq_count, &total_nodes);
     if (ret != SM2_IC_SUCCESS)
     {
-        sm2_revocation_merkle_cleanup(tree);
+        rev_tree_reset(state);
         return ret;
     }
 
     if (total_nodes > SIZE_MAX / SM2_REV_MERKLE_HASH_LEN)
     {
-        sm2_revocation_merkle_cleanup(tree);
+        rev_tree_reset(state);
         return SM2_IC_ERR_MEMORY;
     }
 
-    tree->node_hashes_len = total_nodes * SM2_REV_MERKLE_HASH_LEN;
-    tree->node_hashes = (uint8_t *)calloc(1, tree->node_hashes_len);
-    if (!tree->node_hashes)
+    state->node_hashes_len = total_nodes * SM2_REV_MERKLE_HASH_LEN;
+    state->node_hashes = (uint8_t *)calloc(1, state->node_hashes_len);
+    if (!state->node_hashes)
     {
-        sm2_revocation_merkle_cleanup(tree);
+        rev_tree_reset(state);
         return SM2_IC_ERR_MEMORY;
     }
 
-    size_t leaf_off = tree->level_offsets[0];
-    for (size_t i = 0; i < tree->leaf_count; i++)
+    size_t leaf_off = state->level_offsets[0];
+    for (size_t i = 0; i < state->leaf_count; i++)
     {
         uint8_t *dst
-            = tree->node_hashes + (leaf_off + i) * SM2_REV_MERKLE_HASH_LEN;
-        ret = merkle_hash_leaf(tree->serials[i], dst);
+            = state->node_hashes + (leaf_off + i) * SM2_REV_MERKLE_HASH_LEN;
+        ret = merkle_hash_leaf(state->serials[i], dst);
         if (ret != SM2_IC_SUCCESS)
         {
-            sm2_revocation_merkle_cleanup(tree);
+            rev_tree_reset(state);
             return ret;
         }
     }
 
-    for (size_t level = 0; level + 1 < tree->level_count; level++)
+    for (size_t level = 0; level + 1 < state->level_count; level++)
     {
-        size_t curr_count = tree->level_sizes[level];
-        size_t next_count = tree->level_sizes[level + 1];
-        size_t curr_off = tree->level_offsets[level];
-        size_t next_off = tree->level_offsets[level + 1];
+        size_t curr_count = state->level_sizes[level];
+        size_t next_count = state->level_sizes[level + 1];
+        size_t curr_off = state->level_offsets[level];
+        size_t next_off = state->level_offsets[level + 1];
 
         for (size_t i = 0; i < next_count; i++)
         {
@@ -195,32 +212,51 @@ sm2_ic_error_t sm2_revocation_merkle_build(sm2_rev_merkle_tree_t *tree,
             if (right_idx >= curr_count)
                 right_idx = left_idx;
 
-            const uint8_t *left = tree->node_hashes
+            const uint8_t *left = state->node_hashes
                 + (curr_off + left_idx) * SM2_REV_MERKLE_HASH_LEN;
-            const uint8_t *right = tree->node_hashes
+            const uint8_t *right = state->node_hashes
                 + (curr_off + right_idx) * SM2_REV_MERKLE_HASH_LEN;
             uint8_t *dst
-                = tree->node_hashes + (next_off + i) * SM2_REV_MERKLE_HASH_LEN;
+                = state->node_hashes + (next_off + i) * SM2_REV_MERKLE_HASH_LEN;
 
             ret = merkle_hash_parent(left, right, dst);
             if (ret != SM2_IC_SUCCESS)
             {
-                sm2_revocation_merkle_cleanup(tree);
+                rev_tree_reset(state);
                 return ret;
             }
         }
     }
 
-    size_t root_off = tree->level_offsets[tree->level_count - 1];
-    memcpy(tree->root_hash,
-        tree->node_hashes + root_off * SM2_REV_MERKLE_HASH_LEN,
+    size_t root_off = state->level_offsets[state->level_count - 1];
+    memcpy(state->root_hash,
+        state->node_hashes + root_off * SM2_REV_MERKLE_HASH_LEN,
         SM2_REV_MERKLE_HASH_LEN);
 
     return SM2_IC_SUCCESS;
 }
 
+size_t sm2_rev_tree_leaf_count(const sm2_rev_tree_t *tree)
+{
+    return tree ? tree->leaf_count : 0;
+}
+
+uint64_t sm2_rev_tree_root_version(const sm2_rev_tree_t *tree)
+{
+    return tree ? tree->root_version : 0;
+}
+
+sm2_ic_error_t sm2_rev_tree_get_root_hash(
+    const sm2_rev_tree_t *tree, uint8_t root_hash[SM2_REV_MERKLE_HASH_LEN])
+{
+    if (!tree || !root_hash || !tree->node_hashes)
+        return SM2_IC_ERR_PARAM;
+    memcpy(root_hash, tree->root_hash, SM2_REV_MERKLE_HASH_LEN);
+    return SM2_IC_SUCCESS;
+}
+
 bool merkle_find_serial(
-    const sm2_rev_merkle_tree_t *tree, uint64_t serial, size_t *pos)
+    const sm2_rev_tree_t *tree, uint64_t serial, size_t *pos)
 {
     size_t left = 0;
     size_t right = tree->leaf_count;
@@ -239,9 +275,8 @@ bool merkle_find_serial(
     return left < tree->leaf_count && tree->serials[left] == serial;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_prove_member(
-    const sm2_rev_merkle_tree_t *tree, uint64_t serial_number,
-    sm2_rev_merkle_membership_proof_t *proof)
+sm2_ic_error_t sm2_rev_tree_prove_member(const sm2_rev_tree_t *tree,
+    uint64_t serial_number, sm2_rev_member_proof_t *proof)
 {
     if (!tree || !proof || !tree->node_hashes || tree->level_count == 0)
         return SM2_IC_ERR_PARAM;
@@ -278,9 +313,9 @@ sm2_ic_error_t sm2_revocation_merkle_prove_member(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_verify_member(
+sm2_ic_error_t sm2_rev_tree_verify_member(
     const uint8_t root_hash[SM2_REV_MERKLE_HASH_LEN],
-    const sm2_rev_merkle_membership_proof_t *proof)
+    const sm2_rev_member_proof_t *proof)
 {
     if (!root_hash || !proof)
         return SM2_IC_ERR_PARAM;
@@ -312,9 +347,8 @@ sm2_ic_error_t sm2_revocation_merkle_verify_member(
         : SM2_IC_ERR_VERIFY;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_prove_non_member(
-    const sm2_rev_merkle_tree_t *tree, uint64_t serial_number,
-    sm2_rev_merkle_non_membership_proof_t *proof)
+sm2_ic_error_t sm2_rev_tree_prove_absence(const sm2_rev_tree_t *tree,
+    uint64_t serial_number, sm2_rev_absence_proof_t *proof)
 {
     if (!tree || !proof || !tree->node_hashes || tree->level_count == 0)
         return SM2_IC_ERR_PARAM;
@@ -333,7 +367,7 @@ sm2_ic_error_t sm2_revocation_merkle_prove_non_member(
     if (pos > 0)
     {
         proof->has_left_neighbor = true;
-        sm2_ic_error_t ret = sm2_revocation_merkle_prove_member(
+        sm2_ic_error_t ret = sm2_rev_tree_prove_member(
             tree, tree->serials[pos - 1], &proof->left_proof);
         if (ret != SM2_IC_SUCCESS)
             return ret;
@@ -342,7 +376,7 @@ sm2_ic_error_t sm2_revocation_merkle_prove_non_member(
     if (pos < tree->leaf_count)
     {
         proof->has_right_neighbor = true;
-        sm2_ic_error_t ret = sm2_revocation_merkle_prove_member(
+        sm2_ic_error_t ret = sm2_rev_tree_prove_member(
             tree, tree->serials[pos], &proof->right_proof);
         if (ret != SM2_IC_SUCCESS)
             return ret;
@@ -351,9 +385,9 @@ sm2_ic_error_t sm2_revocation_merkle_prove_non_member(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_verify_non_member(
+sm2_ic_error_t sm2_rev_tree_verify_absence(
     const uint8_t root_hash[SM2_REV_MERKLE_HASH_LEN],
-    const sm2_rev_merkle_non_membership_proof_t *proof)
+    const sm2_rev_absence_proof_t *proof)
 {
     if (!root_hash || !proof)
         return SM2_IC_ERR_PARAM;
@@ -383,8 +417,8 @@ sm2_ic_error_t sm2_revocation_merkle_verify_non_member(
         {
             return SM2_IC_ERR_VERIFY;
         }
-        sm2_ic_error_t ret = sm2_revocation_merkle_verify_member(
-            root_hash, &proof->left_proof);
+        sm2_ic_error_t ret
+            = sm2_rev_tree_verify_member(root_hash, &proof->left_proof);
         if (ret != SM2_IC_SUCCESS)
             return ret;
         if (proof->left_proof.serial_number >= proof->target_serial)
@@ -398,8 +432,8 @@ sm2_ic_error_t sm2_revocation_merkle_verify_non_member(
         {
             return SM2_IC_ERR_VERIFY;
         }
-        sm2_ic_error_t ret = sm2_revocation_merkle_verify_member(
-            root_hash, &proof->right_proof);
+        sm2_ic_error_t ret
+            = sm2_rev_tree_verify_member(root_hash, &proof->right_proof);
         if (ret != SM2_IC_SUCCESS)
             return ret;
         if (proof->target_serial >= proof->right_proof.serial_number)
@@ -427,7 +461,7 @@ sm2_ic_error_t sm2_revocation_merkle_verify_non_member(
     return SM2_IC_SUCCESS;
 }
 sm2_ic_error_t merkle_serialize_root_for_auth(
-    const sm2_rev_merkle_root_record_t *root_record, uint8_t *output,
+    const sm2_rev_root_record_t *root_record, uint8_t *output,
     size_t output_cap, size_t *output_len)
 {
     static const uint8_t tag[] = "SM2REV_MERKLE_ROOT_V1";
@@ -458,10 +492,9 @@ sm2_ic_error_t merkle_serialize_root_for_auth(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_sign_root(
-    const sm2_rev_merkle_tree_t *tree, uint64_t valid_from,
-    uint64_t valid_until, sm2_rev_sync_sign_fn sign_fn, void *sign_user_ctx,
-    sm2_rev_merkle_root_record_t *root_record)
+sm2_ic_error_t sm2_rev_root_sign(const sm2_rev_tree_t *tree,
+    uint64_t valid_from, uint64_t valid_until, sm2_rev_sync_sign_fn sign_fn,
+    void *sign_user_ctx, sm2_rev_root_record_t *root_record)
 {
     if (!tree || !root_record || !sign_fn)
         return SM2_IC_ERR_PARAM;
@@ -495,9 +528,8 @@ sm2_ic_error_t sm2_revocation_merkle_sign_root(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_verify_root_record(
-    const sm2_rev_merkle_root_record_t *root_record, uint64_t now_ts,
-    sm2_rev_sync_verify_fn verify_fn, void *verify_user_ctx)
+sm2_ic_error_t sm2_rev_root_verify(const sm2_rev_root_record_t *root_record,
+    uint64_t now_ts, sm2_rev_sync_verify_fn verify_fn, void *verify_user_ctx)
 {
     if (!root_record || !verify_fn)
         return SM2_IC_ERR_PARAM;
@@ -523,29 +555,28 @@ sm2_ic_error_t sm2_revocation_merkle_verify_root_record(
     return ret == SM2_IC_SUCCESS ? SM2_IC_SUCCESS : SM2_IC_ERR_VERIFY;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_verify_member_with_root(
-    const sm2_rev_merkle_root_record_t *root_record, uint64_t now_ts,
-    const sm2_rev_merkle_membership_proof_t *proof,
-    sm2_rev_sync_verify_fn verify_fn, void *verify_user_ctx)
+sm2_ic_error_t sm2_rev_member_proof_verify_with_root(
+    const sm2_rev_root_record_t *root_record, uint64_t now_ts,
+    const sm2_rev_member_proof_t *proof, sm2_rev_sync_verify_fn verify_fn,
+    void *verify_user_ctx)
 {
-    sm2_ic_error_t ret = sm2_revocation_merkle_verify_root_record(
-        root_record, now_ts, verify_fn, verify_user_ctx);
+    sm2_ic_error_t ret
+        = sm2_rev_root_verify(root_record, now_ts, verify_fn, verify_user_ctx);
     if (ret != SM2_IC_SUCCESS)
         return ret;
 
-    return sm2_revocation_merkle_verify_member(root_record->root_hash, proof);
+    return sm2_rev_tree_verify_member(root_record->root_hash, proof);
 }
 
-sm2_ic_error_t sm2_revocation_merkle_verify_non_member_with_root(
-    const sm2_rev_merkle_root_record_t *root_record, uint64_t now_ts,
-    const sm2_rev_merkle_non_membership_proof_t *proof,
-    sm2_rev_sync_verify_fn verify_fn, void *verify_user_ctx)
+sm2_ic_error_t sm2_rev_absence_proof_verify_with_root(
+    const sm2_rev_root_record_t *root_record, uint64_t now_ts,
+    const sm2_rev_absence_proof_t *proof, sm2_rev_sync_verify_fn verify_fn,
+    void *verify_user_ctx)
 {
-    sm2_ic_error_t ret = sm2_revocation_merkle_verify_root_record(
-        root_record, now_ts, verify_fn, verify_user_ctx);
+    sm2_ic_error_t ret
+        = sm2_rev_root_verify(root_record, now_ts, verify_fn, verify_user_ctx);
     if (ret != SM2_IC_SUCCESS)
         return ret;
 
-    return sm2_revocation_merkle_verify_non_member(
-        root_record->root_hash, proof);
+    return sm2_rev_tree_verify_absence(root_record->root_hash, proof);
 }

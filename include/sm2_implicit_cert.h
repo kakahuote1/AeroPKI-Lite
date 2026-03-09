@@ -121,8 +121,12 @@ extern "C"
 
     /**
      * @brief Certificate issuance context.
-     * @note Holds per-request/per-service issuance policy to avoid mutable
+     * @note Holds
+     * per-request/per-service issuance policy to avoid mutable
      * globals.
+     * Production-safe issuance currently requires the secure default
+     *
+     * full-field certificate template.
      */
     typedef struct
     {
@@ -156,11 +160,20 @@ extern "C"
 
     /* Certificate issuance policy control */
     void sm2_ic_issue_ctx_init(sm2_ic_issue_ctx_t *ctx);
+    /*
+     * Production-safe public issuance only accepts
+     * SM2_IC_FIELD_MASK_ALL.
+     * Other field masks are rejected.
+     */
     sm2_ic_error_t sm2_ic_issue_ctx_set_field_mask(
         sm2_ic_issue_ctx_t *ctx, uint16_t field_mask);
     uint16_t sm2_ic_issue_ctx_get_field_mask(const sm2_ic_issue_ctx_t *ctx);
 
     /* ECQV Core Protocol */
+    /*
+     * key_usage must be a non-zero subset of the defined SM2_KU_* bits.
+
+     */
     sm2_ic_error_t sm2_ic_create_cert_request(sm2_ic_cert_request_t *request,
         const uint8_t *subject_id, size_t subject_id_len, uint8_t key_usage,
         sm2_private_key_t *temp_private_key);
@@ -169,15 +182,19 @@ extern "C"
         const uint8_t *issuer_id, size_t issuer_id_len,
         const sm2_private_key_t *ca_private_key,
         const sm2_ec_point_t *ca_public_key,
-        const sm2_ic_issue_ctx_t *issue_ctx);
+        const sm2_ic_issue_ctx_t *issue_ctx, uint64_t now_ts);
     sm2_ic_error_t sm2_ic_ca_generate_cert(sm2_ic_cert_result_t *result,
         const sm2_ic_cert_request_t *request, const uint8_t *issuer_id,
         size_t issuer_id_len, const sm2_private_key_t *ca_private_key,
-        const sm2_ec_point_t *ca_public_key);
+        const sm2_ec_point_t *ca_public_key, uint64_t now_ts);
     sm2_ic_error_t sm2_ic_reconstruct_keys(sm2_private_key_t *private_key,
         sm2_ec_point_t *public_key, const sm2_ic_cert_result_t *cert_result,
         const sm2_private_key_t *temp_private_key,
         const sm2_ec_point_t *ca_public_key);
+    /*
+     * Verifies only implicit certificates (type ==
+     * SM2_CERT_TYPE_IMPLICIT).
+     */
     sm2_ic_error_t sm2_ic_verify_cert(const sm2_implicit_cert_t *cert,
         const sm2_ec_point_t *public_key, const sm2_ec_point_t *ca_public_key);
 

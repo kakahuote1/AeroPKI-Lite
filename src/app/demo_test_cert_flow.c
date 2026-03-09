@@ -7,6 +7,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include "sm2_pki_service.h"
 #include "sm2_pki_client.h"
 
@@ -23,8 +24,8 @@ static int check_pki(sm2_pki_error_t err, const char *step)
 
 int main(void)
 {
-    sm2_pki_service_ctx_t svc;
-    sm2_pki_client_ctx_t cli;
+    sm2_pki_service_ctx_t *svc = NULL;
+    sm2_pki_client_ctx_t *cli = NULL;
     sm2_pki_error_t err = SM2_PKI_SUCCESS;
 
     const uint8_t issuer[] = "ROOT_CA";
@@ -37,13 +38,15 @@ int main(void)
     sm2_ec_point_t ca_pub;
     sm2_auth_signature_t sig;
     size_t matched_idx = 0;
-    sm2_auth_request_t auth_req;
+    sm2_pki_verify_request_t auth_req;
+    const sm2_implicit_cert_t *cli_cert = NULL;
+    const sm2_ec_point_t *cli_pub = NULL;
 
     sm2_rev_status_t rev_status = SM2_REV_STATUS_UNKNOWN;
     sm2_rev_source_t rev_source = SM2_REV_SOURCE_NONE;
+    uint64_t base_now = (uint64_t)time(NULL);
+    uint64_t auth_now = 0;
 
-    memset(&svc, 0, sizeof(svc));
-    memset(&cli, 0, sizeof(cli));
     memset(&req, 0, sizeof(req));
     memset(&temp_priv, 0, sizeof(temp_priv));
     memset(&cert_res, 0, sizeof(cert_res));
@@ -52,62 +55,75 @@ int main(void)
     memset(&auth_req, 0, sizeof(auth_req));
 
     /* 1) Initialize in-memory CA/RA service */
-    err = sm2_pki_service_init(&svc, issuer, sizeof(issuer) - 1, 64, 300, 1000);
+    err = sm2_pki_service_create(
+        &svc, issuer, sizeof(issuer) - 1, 64, 300, base_now);
     if (!check_pki(err, "Service Init"))
         goto cleanup;
 
     /* 2) Register identity and create certificate request */
     err = sm2_pki_identity_register(
-        &svc, dev_id, sizeof(dev_id) - 1, SM2_KU_DIGITAL_SIGNATURE);
+        svc, dev_id, sizeof(dev_id) - 1, SM2_KU_DIGITAL_SIGNATURE);
     if (!check_pki(err, "Identity Register"))
         goto cleanup;
 
-    err = sm2_pki_cert_request(
-        &svc, dev_id, sizeof(dev_id) - 1, &req, &temp_priv);
-    if (!check_pki(err, "Cert Request"))
+    err = sm2_ic_create_cert_request(
+        &req, dev_id, sizeof(dev_id) - 1, SM2_KU_DIGITAL_SIGNATURE, &temp_priv);
+    if (!check_pki(err, "Create Cert Request"))
+        goto cleanup;
+    err = sm2_pki_cert_authorize_request(svc, &req);
+    if (!check_pki(err, "Authorize Cert Request"))
         goto cleanup;
 
     /* 3) Issue implicit certificate from CA */
-    err = sm2_pki_cert_issue(&svc, &req, &cert_res);
+    err = sm2_pki_cert_issue(svc, &req, base_now, &cert_res);
     if (!check_pki(err, "Cert Issue"))
         goto cleanup;
 
-    err = sm2_pki_service_get_ca_public_key(&svc, &ca_pub);
+    err = sm2_pki_service_get_ca_public_key(svc, &ca_pub);
     if (!check_pki(err, "Get CA Public Key"))
         goto cleanup;
 
     /* 4) Initialize client and reconstruct identity keys */
-    err = sm2_pki_client_init(&cli, &ca_pub, &svc.rev_ctx);
+    err = sm2_pki_client_create(&cli, &ca_pub, svc);
     if (!check_pki(err, "Client Init"))
         goto cleanup;
 
-    err = sm2_pki_client_import_cert(&cli, &cert_res, &temp_priv, &ca_pub);
+    err = sm2_pki_client_import_cert(cli, &cert_res, &temp_priv, &ca_pub);
     if (!check_pki(err, "Import Cert"))
+        goto cleanup;
+    err = sm2_pki_client_get_cert(cli, &cli_cert);
+    if (!check_pki(err, "Get Client Cert"))
+        goto cleanup;
+    err = sm2_pki_client_get_public_key(cli, &cli_pub);
+    if (!check_pki(err, "Get Client Public Key"))
         goto cleanup;
 
     /* 5) Sign and verify (before revocation should pass) */
-    err = sm2_pki_sign(&cli, msg, sizeof(msg) - 1, &sig);
+    err = sm2_pki_sign(cli, msg, sizeof(msg) - 1, &sig);
     if (!check_pki(err, "Sign Message"))
         goto cleanup;
 
-    auth_req.cert = &cli.cert;
-    auth_req.public_key = &cli.public_key;
+    auth_req.cert = cli_cert;
+    auth_req.public_key = cli_pub;
     auth_req.message = msg;
     auth_req.message_len = sizeof(msg) - 1;
     auth_req.signature = &sig;
+    auth_now
+        = cert_res.cert.valid_from != 0 ? cert_res.cert.valid_from : base_now;
 
-    err = sm2_pki_verify(&cli, &auth_req, 1010, &matched_idx);
+    err = sm2_pki_verify(cli, &auth_req, auth_now, &matched_idx);
     if (!check_pki(err, "Verify Before Revoke"))
         goto cleanup;
     printf("[INFO] matched_ca_index=%zu\n", matched_idx);
 
     /* 6) Revoke certificate and confirm revocation state */
-    err = sm2_pki_service_revoke_cert(&svc, cert_res.cert.serial_number, 1015);
+    err = sm2_pki_service_revoke(
+        svc, cert_res.cert.serial_number, auth_now + 5);
     if (!check_pki(err, "Revoke Cert"))
         goto cleanup;
 
-    err = sm2_pki_revoke_check(
-        &svc, cert_res.cert.serial_number, 1016, &rev_status, &rev_source);
+    err = sm2_pki_service_check_revocation(svc, cert_res.cert.serial_number,
+        auth_now + 6, &rev_status, &rev_source);
     if (!check_pki(err, "Revoke Check"))
         goto cleanup;
     printf("[INFO] revoke_status=%d, source=%d\n", (int)rev_status,
@@ -120,7 +136,7 @@ int main(void)
     }
 
     /* 7) Verify after revocation should be rejected */
-    err = sm2_pki_verify(&cli, &auth_req, 1017, &matched_idx);
+    err = sm2_pki_verify(cli, &auth_req, auth_now + 7, &matched_idx);
     if (err == SM2_PKI_SUCCESS)
     {
         printf("[FAIL] Verify After Revoke unexpectedly succeeded\n");
@@ -130,12 +146,12 @@ int main(void)
         "[OK]   Verify After Revoke blocked as expected, err=%d\n", (int)err);
 
     printf("[PASS] demo_test_cert_flow\n");
-    sm2_pki_client_cleanup(&cli);
-    sm2_pki_service_cleanup(&svc);
+    sm2_pki_client_destroy(&cli);
+    sm2_pki_service_destroy(&svc);
     return 0;
 
 cleanup:
-    sm2_pki_client_cleanup(&cli);
-    sm2_pki_service_cleanup(&svc);
+    sm2_pki_client_destroy(&cli);
+    sm2_pki_service_destroy(&svc);
     return 1;
 }

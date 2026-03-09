@@ -1,4 +1,4 @@
-﻿/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-License-Identifier: Apache-2.0 */
 
 /**
  * @file sm2_pki_client.h
@@ -12,77 +12,116 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include "sm2_implicit_cert.h"
+#include "sm2_auth.h"
 #include "sm2_crypto.h"
-#include "sm2_pki_service.h"
 
 #ifdef __cplusplus
 extern "C"
 {
 #endif
 
+    typedef struct sm2_pki_service_ctx_st sm2_pki_service_ctx_t;
+    typedef struct sm2_pki_client_ctx_st sm2_pki_client_ctx_t;
     typedef struct
     {
-        bool initialized;
-        sm2_implicit_cert_t cert;
-        sm2_private_key_t private_key;
-        sm2_ec_point_t public_key;
-        bool has_identity_keys;
+        const sm2_implicit_cert_t *cert;
+        const sm2_ec_point_t *public_key;
+        const uint8_t *message;
+        size_t message_len;
+        const sm2_auth_signature_t *signature;
+    } sm2_pki_verify_request_t;
 
-        sm2_auth_trust_store_t trust_store;
-        sm2_revocation_ctx_t *rev_ctx;
-        sm2_auth_revocation_query_fn revocation_query_fn;
-        void *revocation_query_user_ctx;
-
-        sm2_auth_precompute_pool_t precompute_pool;
-        bool precompute_enabled;
-    } sm2_pki_client_ctx_t;
-
-    sm2_pki_error_t sm2_pki_client_init(sm2_pki_client_ctx_t *ctx,
+    /*
+     * Opaque owning handle.
+     * Instances must be created/destroyed via the API below.
+     */
+    sm2_pki_error_t sm2_pki_client_create(sm2_pki_client_ctx_t **ctx,
         const sm2_ec_point_t *default_ca_public_key,
-        sm2_revocation_ctx_t *rev_ctx);
+        sm2_pki_service_ctx_t *revocation_service);
 
-    void sm2_pki_client_cleanup(sm2_pki_client_ctx_t *ctx);
+    void sm2_pki_client_destroy(sm2_pki_client_ctx_t **ctx);
 
     sm2_pki_error_t sm2_pki_client_add_trusted_ca(
         sm2_pki_client_ctx_t *ctx, const sm2_ec_point_t *ca_public_key);
 
+    sm2_pki_error_t sm2_pki_client_get_cert(
+        const sm2_pki_client_ctx_t *ctx, const sm2_implicit_cert_t **cert);
+
+    sm2_pki_error_t sm2_pki_client_get_public_key(
+        const sm2_pki_client_ctx_t *ctx, const sm2_ec_point_t **public_key);
+
+    bool sm2_pki_client_is_sign_pool_enabled(const sm2_pki_client_ctx_t *ctx);
+
+    /*
+     * Bind the client to a service-managed revocation backend without
+     * exposing internal revocation state objects.
+     */
+    sm2_pki_error_t sm2_pki_client_bind_revocation(
+        sm2_pki_client_ctx_t *ctx, sm2_pki_service_ctx_t *service);
+
+    /*
+     * Install a caller-managed revocation query backend.
+     * This replaces any backend previously provided by
+     * sm2_pki_client_bind_revocation().
+     */
     sm2_pki_error_t sm2_pki_client_set_revocation_query(
         sm2_pki_client_ctx_t *ctx, sm2_auth_revocation_query_fn query_fn,
         void *user_ctx);
 
+    /*
+     * Reconstructs local identity keys and verifies that the certificate is
+     * consistent with the supplied issuer public key before importing it.
+     */
     sm2_pki_error_t sm2_pki_client_import_cert(sm2_pki_client_ctx_t *ctx,
         const sm2_ic_cert_result_t *cert_result,
         const sm2_private_key_t *temp_private_key,
         const sm2_ec_point_t *ca_public_key);
 
-    sm2_pki_error_t sm2_pki_client_enable_precompute(
+    sm2_pki_error_t sm2_pki_client_enable_sign_pool(
         sm2_pki_client_ctx_t *ctx, size_t capacity, size_t target_available);
 
-    void sm2_pki_client_disable_precompute(sm2_pki_client_ctx_t *ctx);
+    void sm2_pki_client_disable_sign_pool(sm2_pki_client_ctx_t *ctx);
 
-    /* Unified API names required by Phase4-S05. */
+    /* Signing, verification and session protection entry points. */
     sm2_pki_error_t sm2_pki_sign(sm2_pki_client_ctx_t *ctx,
         const uint8_t *message, size_t message_len,
         sm2_auth_signature_t *signature);
 
+    /*
+     * High-level PKI verification always uses the client's configured
+     * revocation backend. Callers must leave request-level revocation fields
+     * at their default values and configure revocation via the client APIs.
+     */
     sm2_pki_error_t sm2_pki_verify(sm2_pki_client_ctx_t *ctx,
-        const sm2_auth_request_t *request, uint64_t now_ts,
+        const sm2_pki_verify_request_t *request, uint64_t now_ts,
         size_t *matched_ca_index);
 
     sm2_pki_error_t sm2_pki_batch_verify(const sm2_auth_verify_item_t *items,
         size_t item_count, size_t *valid_count);
 
+    sm2_pki_error_t sm2_pki_generate_ephemeral_keypair(
+        sm2_private_key_t *ephemeral_private_key,
+        sm2_ec_point_t *ephemeral_public_key);
+
     sm2_pki_error_t sm2_pki_key_agreement(sm2_pki_client_ctx_t *ctx,
-        const sm2_ec_point_t *peer_public_key, uint8_t *session_key,
+        const sm2_private_key_t *local_ephemeral_private_key,
+        const sm2_ec_point_t *peer_public_key,
+        const sm2_ec_point_t *peer_ephemeral_public_key,
+        const uint8_t *transcript, size_t transcript_len, uint8_t *session_key,
         size_t session_key_len);
 
-    sm2_pki_error_t sm2_pki_encrypt(const uint8_t key[16], const uint8_t iv[16],
-        const uint8_t *plaintext, size_t plaintext_len, uint8_t *ciphertext,
-        size_t *ciphertext_len);
+    sm2_pki_error_t sm2_pki_encrypt(sm2_pki_aead_mode_t mode,
+        const uint8_t key[16], const uint8_t *iv, size_t iv_len,
+        const uint8_t *aad, size_t aad_len, const uint8_t *plaintext,
+        size_t plaintext_len, uint8_t *ciphertext, size_t *ciphertext_len,
+        uint8_t *tag, size_t *tag_len);
 
-    sm2_pki_error_t sm2_pki_decrypt(const uint8_t key[16], const uint8_t iv[16],
-        const uint8_t *ciphertext, size_t ciphertext_len, uint8_t *plaintext,
-        size_t *plaintext_len);
+    sm2_pki_error_t sm2_pki_decrypt(sm2_pki_aead_mode_t mode,
+        const uint8_t key[16], const uint8_t *iv, size_t iv_len,
+        const uint8_t *aad, size_t aad_len, const uint8_t *ciphertext,
+        size_t ciphertext_len, const uint8_t *tag, size_t tag_len,
+        uint8_t *plaintext, size_t *plaintext_len);
 
 #ifdef __cplusplus
 }

@@ -1,9 +1,9 @@
-﻿/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-License-Identifier: Apache-2.0 */
 
 /*
  * Demo Test 2:
  * Merkle accumulator capabilities:
- * 1) member/non-member proof verification,
+ * 1) member/absence proof verification,
  * 2) multiproof bandwidth reduction,
  * 3) k-anonymity query packing and risk estimate.
  */
@@ -39,20 +39,20 @@ int main(void)
     uint64_t *decoys = NULL;
     size_t decoy_count = 0;
 
-    sm2_rev_merkle_tree_t tree;
-    sm2_rev_merkle_membership_proof_t mp_real;
-    sm2_rev_merkle_non_membership_proof_t nmp;
-    sm2_rev_merkle_k_anon_query_t kq;
-    sm2_rev_merkle_multiproof_t multi;
+    sm2_rev_tree_t *tree = NULL;
+    sm2_rev_member_proof_t mp_real;
+    sm2_rev_absence_proof_t nmp;
+    sm2_rev_kanon_query_t kq;
+    sm2_rev_multi_proof_t *multi = NULL;
+    uint8_t tree_root_hash[SM2_REV_MERKLE_HASH_LEN];
 
     uint8_t multi_buf[262144];
     size_t multi_len = sizeof(multi_buf);
 
-    memset(&tree, 0, sizeof(tree));
     memset(&mp_real, 0, sizeof(mp_real));
     memset(&nmp, 0, sizeof(nmp));
     memset(&kq, 0, sizeof(kq));
-    memset(&multi, 0, sizeof(multi));
+    memset(tree_root_hash, 0, sizeof(tree_root_hash));
 
     revoked = (uint64_t *)calloc(revoked_n, sizeof(uint64_t));
     decoys = (uint64_t *)calloc(revoked_n - 1, sizeof(uint64_t));
@@ -78,63 +78,62 @@ int main(void)
         decoys[decoy_count++] = revoked[i];
     }
 
-    ret = sm2_revocation_merkle_build(&tree, revoked, revoked_n, 2026030701ULL);
+    ret = sm2_rev_tree_build(&tree, revoked, revoked_n, 2026030701ULL);
     if (!check_ic(ret, "Build Merkle Tree"))
         goto cleanup;
+    ret = sm2_rev_tree_get_root_hash(tree, tree_root_hash);
+    if (!check_ic(ret, "Read Merkle Root Hash"))
+        goto cleanup;
 
-    ret = sm2_revocation_merkle_prove_member(&tree, real_serial, &mp_real);
+    ret = sm2_rev_tree_prove_member(tree, real_serial, &mp_real);
     if (!check_ic(ret, "Build Member Proof"))
         goto cleanup;
 
-    ret = sm2_revocation_merkle_verify_member(tree.root_hash, &mp_real);
+    ret = sm2_rev_tree_verify_member(tree_root_hash, &mp_real);
     if (!check_ic(ret, "Verify Member Proof"))
         goto cleanup;
 
-    ret = sm2_revocation_merkle_prove_non_member(&tree, good_serial, &nmp);
+    ret = sm2_rev_tree_prove_absence(tree, good_serial, &nmp);
     if (!check_ic(ret, "Build Non-Member Proof"))
         goto cleanup;
 
-    ret = sm2_revocation_merkle_verify_non_member(tree.root_hash, &nmp);
+    ret = sm2_rev_tree_verify_absence(tree_root_hash, &nmp);
     if (!check_ic(ret, "Verify Non-Member Proof"))
         goto cleanup;
 
-    ret = sm2_revocation_merkle_build_k_anon_query(
+    ret = sm2_rev_kanon_build_query(
         real_serial, decoys, decoy_count, k, 0xA55AA55AULL, &kq);
     if (!check_ic(ret, "Build K-Anon Query"))
         goto cleanup;
 
-    ret = sm2_revocation_merkle_build_multiproof(
-        &tree, kq.serials, kq.serial_count, &multi);
+    ret = sm2_rev_multi_proof_build(tree, kq.serials, kq.serial_count, &multi);
     if (!check_ic(ret, "Build Multi-Proof"))
         goto cleanup;
 
-    ret = sm2_revocation_merkle_verify_multiproof(tree.root_hash, &multi);
+    ret = sm2_rev_multi_proof_verify(tree_root_hash, multi);
     if (!check_ic(ret, "Verify Multi-Proof"))
         goto cleanup;
 
-    ret = sm2_revocation_merkle_cbor_encode_multiproof(
-        &multi, multi_buf, &multi_len);
+    ret = sm2_rev_multi_proof_encode(multi, multi_buf, &multi_len);
     if (!check_ic(ret, "Encode Multi-Proof"))
         goto cleanup;
 
     size_t single_total = 0;
     for (size_t i = 0; i < kq.serial_count; i++)
     {
-        sm2_rev_merkle_membership_proof_t mp_each;
+        sm2_rev_member_proof_t mp_each;
         uint8_t mp_buf[8192];
         size_t mp_len = sizeof(mp_buf);
 
         memset(&mp_each, 0, sizeof(mp_each));
-        ret = sm2_revocation_merkle_prove_member(
-            &tree, kq.serials[i], &mp_each);
+        ret = sm2_rev_tree_prove_member(tree, kq.serials[i], &mp_each);
         if (ret != SM2_IC_SUCCESS)
         {
             printf("[FAIL] Build Single Proof #%zu, err=%d\n", i, (int)ret);
             goto cleanup;
         }
 
-        ret = sm2_revocation_merkle_cbor_encode_member_proof(
-            &mp_each, mp_buf, &mp_len);
+        ret = sm2_rev_member_proof_encode(&mp_each, mp_buf, &mp_len);
         if (ret != SM2_IC_SUCCESS)
         {
             printf("[FAIL] Encode Single Proof #%zu, err=%d\n", i, (int)ret);
@@ -150,8 +149,7 @@ int main(void)
 
     double risk_score = 0.0;
     uint64_t span = 0;
-    ret = sm2_revocation_merkle_estimate_k_anon_risk(
-        &kq, real_serial, &risk_score, &span);
+    ret = sm2_rev_kanon_estimate_risk(&kq, real_serial, &risk_score, &span);
     if (!check_ic(ret, "Estimate K-Anon Risk"))
         goto cleanup;
 
@@ -176,15 +174,15 @@ int main(void)
     printf("[OK]   K-Anon risk score in valid range\n");
 
     printf("[PASS] demo_test_merkle_flow\n");
-    sm2_revocation_merkle_multiproof_cleanup(&multi);
-    sm2_revocation_merkle_cleanup(&tree);
+    sm2_rev_multi_proof_cleanup(&multi);
+    sm2_rev_tree_cleanup(&tree);
     free(decoys);
     free(revoked);
     return 0;
 
 cleanup:
-    sm2_revocation_merkle_multiproof_cleanup(&multi);
-    sm2_revocation_merkle_cleanup(&tree);
+    sm2_rev_multi_proof_cleanup(&multi);
+    sm2_rev_tree_cleanup(&tree);
     free(decoys);
     free(revoked);
     return 1;

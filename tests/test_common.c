@@ -63,3 +63,59 @@ double calc_median_value(double *samples, size_t count)
         return samples[count / 2];
     return (samples[(count / 2) - 1] + samples[count / 2]) / 2.0;
 }
+
+uint64_t test_now_unix(void)
+{
+    time_t now = time(NULL);
+    if (now < 0)
+        return 0;
+    return (uint64_t)now;
+}
+
+uint64_t test_cert_now(const sm2_implicit_cert_t *cert)
+{
+    if (cert && cert->valid_from != 0)
+        return cert->valid_from;
+    return test_now_unix();
+}
+
+uint64_t test_cert_pair_now(
+    const sm2_implicit_cert_t *cert_a, const sm2_implicit_cert_t *cert_b)
+{
+    uint64_t now_a = test_cert_now(cert_a);
+    uint64_t now_b = test_cert_now(cert_b);
+    return now_a > now_b ? now_a : now_b;
+}
+
+int test_benchmarks_enabled(void)
+{
+    const char *flag = getenv("TINYPKI_RUN_BENCHMARKS");
+    return flag && flag[0] != '\0' && strcmp(flag, "0") != 0;
+}
+
+int test_generate_sm2_keypair(
+    sm2_private_key_t *private_key, sm2_ec_point_t *public_key)
+{
+    return sm2_auth_generate_ephemeral_keypair(private_key, public_key)
+        == SM2_IC_SUCCESS;
+}
+
+void test_setup_ca(void)
+{
+    TEST_ASSERT(
+        test_generate_sm2_keypair(&g_ca_priv, &g_ca_pub), "CA Keypair Failed");
+    g_ca_initialized = 1;
+}
+
+int run_named_test_suite(const char *title, void (*run_suite)(void))
+{
+    if (!run_suite)
+        return -1;
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+    printf("--- %s ---\n", title ? title : "TinyPKI Test Suite");
+    run_suite();
+    printf("\nSummary: %d Run, %d Passed, %d Failed.\n", g_tests_run,
+        g_tests_passed, g_tests_failed);
+    return g_tests_failed == 0 ? 0 : -1;
+}

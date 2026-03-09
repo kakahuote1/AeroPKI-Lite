@@ -1,4 +1,4 @@
-﻿/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-License-Identifier: Apache-2.0 */
 
 /**
  * @file merkle_epoch.c
@@ -65,8 +65,8 @@ sm2_ic_error_t merkle_calc_patch_digest(const sm2_crl_delta_item_t *items,
 }
 
 sm2_ic_error_t merkle_epoch_serialize_for_auth(
-    const sm2_rev_merkle_epoch_directory_t *directory, uint8_t *output,
-    size_t output_cap, size_t *output_len)
+    const sm2_rev_epoch_dir_t *directory, uint8_t *output, size_t output_cap,
+    size_t *output_len)
 {
     static const uint8_t tag[] = "SM2REV_MERKLE_EPOCH_DIR_V1";
     uint8_t patch_digest[SM2_REV_MERKLE_HASH_LEN];
@@ -121,8 +121,7 @@ sm2_ic_error_t merkle_epoch_serialize_for_auth(
 }
 
 bool merkle_epoch_patch_lookup(
-    const sm2_rev_merkle_epoch_directory_t *directory, uint64_t serial,
-    bool *revoked)
+    const sm2_rev_epoch_dir_t *directory, uint64_t serial, bool *revoked)
 {
     if (!directory || !revoked || !directory->patch_items)
         return false;
@@ -149,9 +148,9 @@ bool merkle_epoch_patch_lookup(
     return false;
 }
 
-bool merkle_epoch_get_cached_hash(
-    const sm2_rev_merkle_epoch_directory_t *directory, size_t level_index,
-    size_t node_index, uint8_t out_hash[SM2_REV_MERKLE_HASH_LEN])
+bool merkle_epoch_get_cached_hash(const sm2_rev_epoch_dir_t *directory,
+    size_t level_index, size_t node_index,
+    uint8_t out_hash[SM2_REV_MERKLE_HASH_LEN])
 {
     if (!directory || !out_hash || !directory->cached_hashes)
         return false;
@@ -176,8 +175,7 @@ bool merkle_epoch_get_cached_hash(
     return false;
 }
 
-void sm2_revocation_merkle_epoch_directory_cleanup(
-    sm2_rev_merkle_epoch_directory_t *directory)
+static void epoch_dir_reset(sm2_rev_epoch_dir_t *directory)
 {
     if (!directory)
         return;
@@ -187,16 +185,36 @@ void sm2_revocation_merkle_epoch_directory_cleanup(
     memset(directory, 0, sizeof(*directory));
 }
 
+static sm2_ic_error_t epoch_dir_ensure(sm2_rev_epoch_dir_t **directory)
+{
+    if (!directory)
+        return SM2_IC_ERR_PARAM;
+    if (!*directory)
+    {
+        *directory = (sm2_rev_epoch_dir_t *)calloc(1, sizeof(**directory));
+        if (!*directory)
+            return SM2_IC_ERR_MEMORY;
+    }
+    return SM2_IC_SUCCESS;
+}
+
+void sm2_rev_epoch_dir_cleanup(sm2_rev_epoch_dir_t **directory)
+{
+    if (!directory || !*directory)
+        return;
+
+    epoch_dir_reset(*directory);
+    free(*directory);
+    *directory = NULL;
+}
+
 sm2_ic_error_t merkle_epoch_directory_clone(
-    sm2_rev_merkle_epoch_directory_t *dst,
-    const sm2_rev_merkle_epoch_directory_t *src)
+    sm2_rev_epoch_dir_t *dst, const sm2_rev_epoch_dir_t *src)
 {
     if (!dst || !src)
         return SM2_IC_ERR_PARAM;
 
-    sm2_rev_merkle_epoch_directory_t tmp;
-    memset(&tmp, 0, sizeof(tmp));
-    tmp = *src;
+    sm2_rev_epoch_dir_t tmp = *src;
     tmp.cached_hashes = NULL;
     tmp.patch_items = NULL;
 
@@ -234,16 +252,15 @@ sm2_ic_error_t merkle_epoch_directory_clone(
             src->patch_item_count * sizeof(sm2_crl_delta_item_t));
     }
 
-    sm2_revocation_merkle_epoch_directory_cleanup(dst);
+    epoch_dir_reset(dst);
     *dst = tmp;
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_build_epoch_directory(
-    const sm2_rev_merkle_tree_t *tree, uint64_t epoch_id,
-    size_t cache_top_levels, uint64_t valid_from, uint64_t valid_until,
-    sm2_rev_sync_sign_fn sign_fn, void *sign_user_ctx,
-    sm2_rev_merkle_epoch_directory_t *directory)
+sm2_ic_error_t sm2_rev_epoch_dir_build(const sm2_rev_tree_t *tree,
+    uint64_t epoch_id, size_t cache_top_levels, uint64_t valid_from,
+    uint64_t valid_until, sm2_rev_sync_sign_fn sign_fn, void *sign_user_ctx,
+    sm2_rev_epoch_dir_t **directory)
 {
     if (!tree || !directory || !sign_fn)
         return SM2_IC_ERR_PARAM;
@@ -257,114 +274,117 @@ sm2_ic_error_t sm2_revocation_merkle_build_epoch_directory(
         return SM2_IC_ERR_PARAM;
     }
 
-    sm2_revocation_merkle_epoch_directory_cleanup(directory);
+    sm2_ic_error_t ret = epoch_dir_ensure(directory);
+    if (ret != SM2_IC_SUCCESS)
+        return ret;
+    sm2_rev_epoch_dir_t *state = *directory;
+    epoch_dir_reset(state);
 
-    directory->epoch_id = epoch_id;
-    directory->tree_level_count = tree->level_count;
+    state->epoch_id = epoch_id;
+    state->tree_level_count = tree->level_count;
 
-    sm2_ic_error_t ret = sm2_revocation_merkle_sign_root(tree, valid_from,
-        valid_until, sign_fn, sign_user_ctx, &directory->root_record);
+    ret = sm2_rev_root_sign(tree, valid_from, valid_until, sign_fn,
+        sign_user_ctx, &state->root_record);
     if (ret != SM2_IC_SUCCESS)
     {
-        sm2_revocation_merkle_epoch_directory_cleanup(directory);
+        epoch_dir_reset(state);
         return ret;
     }
 
     size_t sibling_levels = tree->level_count - 1;
-    directory->cache_level_count = cache_top_levels;
-    if (directory->cache_level_count > sibling_levels)
-        directory->cache_level_count = sibling_levels;
-    if (directory->cache_level_count == 0)
+    state->cache_level_count = cache_top_levels;
+    if (state->cache_level_count > sibling_levels)
+        state->cache_level_count = sibling_levels;
+    if (state->cache_level_count == 0)
     {
-        sm2_revocation_merkle_epoch_directory_cleanup(directory);
+        epoch_dir_reset(state);
         return SM2_IC_ERR_PARAM;
     }
 
-    size_t start_level = sibling_levels - directory->cache_level_count;
+    size_t start_level = sibling_levels - state->cache_level_count;
     size_t total_hashes = 0;
 
-    for (size_t i = 0; i < directory->cache_level_count; i++)
+    for (size_t i = 0; i < state->cache_level_count; i++)
     {
         size_t level_idx = start_level + i;
         size_t level_size = tree->level_sizes[level_idx];
 
-        directory->cached_level_indices[i] = level_idx;
-        directory->cached_level_sizes[i] = level_size;
-        directory->cached_level_offsets[i] = total_hashes;
+        state->cached_level_indices[i] = level_idx;
+        state->cached_level_sizes[i] = level_size;
+        state->cached_level_offsets[i] = total_hashes;
 
         if (total_hashes > SIZE_MAX - level_size)
         {
-            sm2_revocation_merkle_epoch_directory_cleanup(directory);
+            epoch_dir_reset(state);
             return SM2_IC_ERR_MEMORY;
         }
         total_hashes += level_size;
     }
 
-    directory->cached_hash_count = total_hashes;
+    state->cached_hash_count = total_hashes;
     if (total_hashes > 0)
     {
         if (total_hashes > SIZE_MAX / SM2_REV_MERKLE_HASH_LEN)
         {
-            sm2_revocation_merkle_epoch_directory_cleanup(directory);
+            epoch_dir_reset(state);
             return SM2_IC_ERR_MEMORY;
         }
 
-        directory->cached_hashes
-            = calloc(total_hashes, sizeof(*directory->cached_hashes));
-        if (!directory->cached_hashes)
+        state->cached_hashes
+            = calloc(total_hashes, sizeof(*state->cached_hashes));
+        if (!state->cached_hashes)
         {
-            sm2_revocation_merkle_epoch_directory_cleanup(directory);
+            epoch_dir_reset(state);
             return SM2_IC_ERR_MEMORY;
         }
 
-        for (size_t i = 0; i < directory->cache_level_count; i++)
+        for (size_t i = 0; i < state->cache_level_count; i++)
         {
-            size_t level_idx = directory->cached_level_indices[i];
-            size_t level_size = directory->cached_level_sizes[i];
-            size_t level_off = directory->cached_level_offsets[i];
+            size_t level_idx = state->cached_level_indices[i];
+            size_t level_size = state->cached_level_sizes[i];
+            size_t level_off = state->cached_level_offsets[i];
             size_t src_off = tree->level_offsets[level_idx];
-            memcpy(directory->cached_hashes + level_off,
+            memcpy(state->cached_hashes + level_off,
                 tree->node_hashes + src_off * SM2_REV_MERKLE_HASH_LEN,
                 level_size * SM2_REV_MERKLE_HASH_LEN);
         }
     }
 
-    directory->patch_version = 0;
-    directory->patch_items = NULL;
-    directory->patch_item_count = 0;
+    state->patch_version = 0;
+    state->patch_items = NULL;
+    state->patch_item_count = 0;
 
     uint8_t auth_buf[256];
     size_t auth_len = 0;
     ret = merkle_epoch_serialize_for_auth(
-        directory, auth_buf, sizeof(auth_buf), &auth_len);
+        state, auth_buf, sizeof(auth_buf), &auth_len);
     if (ret != SM2_IC_SUCCESS)
     {
-        sm2_revocation_merkle_epoch_directory_cleanup(directory);
+        epoch_dir_reset(state);
         return ret;
     }
 
-    size_t sig_len = sizeof(directory->directory_signature);
-    ret = sign_fn(sign_user_ctx, auth_buf, auth_len,
-        directory->directory_signature, &sig_len);
+    size_t sig_len = sizeof(state->directory_signature);
+    ret = sign_fn(sign_user_ctx, auth_buf, auth_len, state->directory_signature,
+        &sig_len);
     if (ret != SM2_IC_SUCCESS || sig_len == 0
-        || sig_len > sizeof(directory->directory_signature))
+        || sig_len > sizeof(state->directory_signature))
     {
-        sm2_revocation_merkle_epoch_directory_cleanup(directory);
+        epoch_dir_reset(state);
         return SM2_IC_ERR_VERIFY;
     }
 
-    directory->directory_signature_len = sig_len;
+    state->directory_signature_len = sig_len;
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_verify_epoch_directory(
-    const sm2_rev_merkle_epoch_directory_t *directory, uint64_t now_ts,
-    sm2_rev_sync_verify_fn verify_fn, void *verify_user_ctx)
+sm2_ic_error_t sm2_rev_epoch_dir_verify(const sm2_rev_epoch_dir_t *directory,
+    uint64_t now_ts, sm2_rev_sync_verify_fn verify_fn, void *verify_user_ctx)
 {
     if (!directory || !verify_fn)
         return SM2_IC_ERR_PARAM;
 
-    sm2_ic_error_t ret = sm2_revocation_merkle_verify_root_record(
+    sm2_ic_error_t ret = sm2_rev_root_verify(
         &directory->root_record, now_ts, verify_fn, verify_user_ctx);
     if (ret != SM2_IC_SUCCESS)
         return ret;
@@ -416,10 +436,9 @@ sm2_ic_error_t sm2_revocation_merkle_verify_epoch_directory(
     return ret == SM2_IC_SUCCESS ? SM2_IC_SUCCESS : SM2_IC_ERR_VERIFY;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_epoch_apply_hot_patch(
-    sm2_rev_merkle_epoch_directory_t *directory, uint64_t patch_version,
-    const sm2_crl_delta_item_t *items, size_t item_count,
-    sm2_rev_sync_sign_fn sign_fn, void *sign_user_ctx)
+sm2_ic_error_t sm2_rev_epoch_apply_patch(sm2_rev_epoch_dir_t *directory,
+    uint64_t patch_version, const sm2_crl_delta_item_t *items,
+    size_t item_count, sm2_rev_sync_sign_fn sign_fn, void *sign_user_ctx)
 {
     if (!directory || !sign_fn)
         return SM2_IC_ERR_PARAM;
@@ -516,17 +535,17 @@ sm2_ic_error_t sm2_revocation_merkle_epoch_apply_hot_patch(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_prove_member_cached(
-    const sm2_rev_merkle_tree_t *tree, uint64_t serial_number,
-    size_t cache_top_levels, sm2_rev_merkle_cached_member_proof_t *proof)
+sm2_ic_error_t sm2_rev_epoch_prove_member_cached(const sm2_rev_tree_t *tree,
+    uint64_t serial_number, size_t cache_top_levels,
+    sm2_rev_cached_member_proof_t *proof)
 {
     if (!tree || !proof)
         return SM2_IC_ERR_PARAM;
 
     memset(proof, 0, sizeof(*proof));
 
-    sm2_ic_error_t ret = sm2_revocation_merkle_prove_member(
-        tree, serial_number, &proof->proof);
+    sm2_ic_error_t ret
+        = sm2_rev_tree_prove_member(tree, serial_number, &proof->proof);
     if (ret != SM2_IC_SUCCESS)
         return ret;
 
@@ -539,15 +558,15 @@ sm2_ic_error_t sm2_revocation_merkle_prove_member_cached(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_verify_member_cached(
-    const sm2_rev_merkle_epoch_directory_t *directory, uint64_t now_ts,
-    const sm2_rev_merkle_cached_member_proof_t *proof,
+sm2_ic_error_t sm2_rev_epoch_verify_member_cached(
+    const sm2_rev_epoch_dir_t *directory, uint64_t now_ts,
+    const sm2_rev_cached_member_proof_t *proof,
     sm2_rev_sync_verify_fn verify_fn, void *verify_user_ctx)
 {
     if (!directory || !proof || !verify_fn)
         return SM2_IC_ERR_PARAM;
 
-    sm2_ic_error_t ret = sm2_revocation_merkle_verify_epoch_directory(
+    sm2_ic_error_t ret = sm2_rev_epoch_dir_verify(
         directory, now_ts, verify_fn, verify_user_ctx);
     if (ret != SM2_IC_SUCCESS)
         return ret;
@@ -572,7 +591,7 @@ sm2_ic_error_t sm2_revocation_merkle_verify_member_cached(
         return SM2_IC_ERR_VERIFY;
     }
 
-    sm2_rev_merkle_membership_proof_t full = proof->proof;
+    sm2_rev_member_proof_t full = proof->proof;
     size_t present_count = full.sibling_count;
     full.sibling_count = expected_depth;
 
@@ -603,19 +622,17 @@ sm2_ic_error_t sm2_revocation_merkle_verify_member_cached(
         level_size = (level_size + 1) / 2;
     }
 
-    return sm2_revocation_merkle_verify_member(
-        directory->root_record.root_hash, &full);
+    return sm2_rev_tree_verify_member(directory->root_record.root_hash, &full);
 }
 
-sm2_ic_error_t sm2_revocation_merkle_epoch_query_patch_first(
-    const sm2_rev_merkle_epoch_directory_t *directory, uint64_t now_ts,
-    uint64_t serial_number, sm2_rev_sync_verify_fn verify_fn,
+sm2_ic_error_t sm2_rev_epoch_lookup(const sm2_rev_epoch_dir_t *directory,
+    uint64_t now_ts, uint64_t serial_number, sm2_rev_sync_verify_fn verify_fn,
     void *verify_user_ctx, sm2_rev_status_t *status)
 {
     if (!directory || !verify_fn || !status)
         return SM2_IC_ERR_PARAM;
 
-    sm2_ic_error_t ret = sm2_revocation_merkle_verify_epoch_directory(
+    sm2_ic_error_t ret = sm2_rev_epoch_dir_verify(
         directory, now_ts, verify_fn, verify_user_ctx);
     if (ret != SM2_IC_SUCCESS)
         return ret;
@@ -631,36 +648,68 @@ sm2_ic_error_t sm2_revocation_merkle_epoch_query_patch_first(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_epoch_switch(
-    sm2_rev_merkle_epoch_directory_t *local_directory,
-    const sm2_rev_merkle_epoch_directory_t *incoming_directory, uint64_t now_ts,
+sm2_ic_error_t sm2_rev_epoch_switch(sm2_rev_epoch_dir_t **local_directory,
+    const sm2_rev_epoch_dir_t *incoming_directory, uint64_t now_ts,
     sm2_rev_sync_verify_fn verify_fn, void *verify_user_ctx)
 {
     if (!local_directory || !incoming_directory || !verify_fn)
         return SM2_IC_ERR_PARAM;
 
-    sm2_ic_error_t ret = sm2_revocation_merkle_verify_epoch_directory(
+    sm2_ic_error_t ret = sm2_rev_epoch_dir_verify(
         incoming_directory, now_ts, verify_fn, verify_user_ctx);
     if (ret != SM2_IC_SUCCESS)
         return ret;
 
-    if (local_directory->directory_signature_len > 0)
+    sm2_rev_epoch_dir_t *state = *local_directory;
+    if (state && state->directory_signature_len > 0)
     {
-        if (incoming_directory->epoch_id < local_directory->epoch_id)
+        if (incoming_directory->epoch_id < state->epoch_id)
             return SM2_IC_ERR_VERIFY;
-        if (incoming_directory->epoch_id == local_directory->epoch_id
+        if (incoming_directory->epoch_id == state->epoch_id
             && incoming_directory->root_record.root_version
-                < local_directory->root_record.root_version)
+                < state->root_record.root_version)
         {
             return SM2_IC_ERR_VERIFY;
         }
-        if (incoming_directory->epoch_id == local_directory->epoch_id
-            && incoming_directory->patch_version
-                < local_directory->patch_version)
+        if (incoming_directory->epoch_id == state->epoch_id
+            && incoming_directory->patch_version < state->patch_version)
         {
             return SM2_IC_ERR_VERIFY;
         }
     }
 
-    return merkle_epoch_directory_clone(local_directory, incoming_directory);
+    if (!state)
+    {
+        ret = epoch_dir_ensure(local_directory);
+        if (ret != SM2_IC_SUCCESS)
+            return ret;
+        state = *local_directory;
+    }
+
+    return merkle_epoch_directory_clone(state, incoming_directory);
+}
+
+size_t sm2_rev_epoch_dir_tree_level_count(const sm2_rev_epoch_dir_t *directory)
+{
+    return directory ? directory->tree_level_count : 0;
+}
+
+size_t sm2_rev_epoch_dir_cache_level_count(const sm2_rev_epoch_dir_t *directory)
+{
+    return directory ? directory->cache_level_count : 0;
+}
+
+uint64_t sm2_rev_epoch_dir_patch_version(const sm2_rev_epoch_dir_t *directory)
+{
+    return directory ? directory->patch_version : 0;
+}
+
+sm2_ic_error_t sm2_rev_epoch_dir_get_root_record(
+    const sm2_rev_epoch_dir_t *directory, sm2_rev_root_record_t *root_record)
+{
+    if (!directory || !root_record)
+        return SM2_IC_ERR_PARAM;
+
+    *root_record = directory->root_record;
+    return SM2_IC_SUCCESS;
 }

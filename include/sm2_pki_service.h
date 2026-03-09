@@ -1,4 +1,4 @@
-﻿/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-License-Identifier: Apache-2.0 */
 
 /**
  * @file sm2_pki_service.h
@@ -26,59 +26,73 @@ extern "C"
 #define SM2_PKI_MAX_ID_LEN 64
 #define SM2_PKI_MAX_ISSUER_LEN 64
 
-    typedef struct
-    {
-        bool used;
-        uint8_t identity[SM2_PKI_MAX_ID_LEN];
-        size_t identity_len;
-        uint8_t key_usage;
-        uint64_t issued_serial;
-        bool revoked;
-    } sm2_pki_identity_entry_t;
+    typedef struct sm2_pki_service_ctx_st sm2_pki_service_ctx_t;
 
-    typedef struct
-    {
-        bool initialized;
-        uint8_t issuer_id[SM2_PKI_MAX_ISSUER_LEN];
-        size_t issuer_id_len;
-        sm2_ic_issue_ctx_t issue_ctx;
-
-        sm2_private_key_t ca_private_key;
-        sm2_ec_point_t ca_public_key;
-
-        sm2_pki_identity_entry_t identities[SM2_PKI_MAX_IDENTITIES];
-        size_t identity_count;
-
-        sm2_revocation_ctx_t rev_ctx;
-    } sm2_pki_service_ctx_t;
-
-    sm2_pki_error_t sm2_pki_service_init(sm2_pki_service_ctx_t *ctx,
+    /*
+     * Opaque owning handle.
+     * Instances must be created/destroyed via the API below.
+     */
+    sm2_pki_error_t sm2_pki_service_create(sm2_pki_service_ctx_t **ctx,
         const uint8_t *issuer_id, size_t issuer_id_len,
         size_t expected_revoked_items, uint64_t filter_ttl_sec,
         uint64_t now_ts);
 
-    void sm2_pki_service_cleanup(sm2_pki_service_ctx_t *ctx);
+    void sm2_pki_service_destroy(sm2_pki_service_ctx_t **ctx);
 
     sm2_pki_error_t sm2_pki_service_get_ca_public_key(
         const sm2_pki_service_ctx_t *ctx, sm2_ec_point_t *ca_public_key);
 
-    sm2_pki_error_t sm2_pki_service_set_cert_field_mask(
-        sm2_pki_service_ctx_t *ctx, uint16_t field_mask);
+    /*
+     * Startup/self-check helper. Validates that the internally managed CA
+     * signing key remains within the expected SM2 private key range.
+     */
+    sm2_pki_error_t sm2_pki_service_validate_ca_key_material(
+        const sm2_pki_service_ctx_t *ctx);
+
+    sm2_pki_error_t sm2_pki_service_get_root_record(
+        const sm2_pki_service_ctx_t *ctx, sm2_rev_root_record_t *root_record);
+
+    /*
+     * Preferred publication/export APIs for revocation artifacts. These keep
+     * the service-side Merkle tree internal while exposing signed outputs.
+     */
+    sm2_pki_error_t sm2_pki_service_export_epoch_dir(sm2_pki_service_ctx_t *ctx,
+        uint64_t epoch_id, size_t cache_top_levels, uint64_t valid_from,
+        uint64_t valid_until, sm2_rev_epoch_dir_t **directory);
+
+    sm2_pki_error_t sm2_pki_service_export_member_proof(
+        const sm2_pki_service_ctx_t *ctx, uint64_t serial_number,
+        sm2_rev_member_proof_t *proof);
+
+    sm2_pki_error_t sm2_pki_service_export_absence_proof(
+        const sm2_pki_service_ctx_t *ctx, uint64_t serial_number,
+        sm2_rev_absence_proof_t *proof);
+
+    /*
+     * Explicitly publishes a fresh CA-signed revocation root/heartbeat object.
+     * Query handling must not mint new signed facts implicitly.
+     */
+    sm2_pki_error_t sm2_pki_service_refresh_root(
+        sm2_pki_service_ctx_t *ctx, uint64_t now_ts);
 
     sm2_pki_error_t sm2_pki_identity_register(sm2_pki_service_ctx_t *ctx,
         const uint8_t *identity, size_t identity_len, uint8_t key_usage);
 
-    sm2_pki_error_t sm2_pki_cert_request(sm2_pki_service_ctx_t *ctx,
-        const uint8_t *identity, size_t identity_len,
-        sm2_ic_cert_request_t *request, sm2_private_key_t *temp_private_key);
+    /*
+     * New deployments must generate ECQV requests on the end-entity side and
+     * submit them for authorization before issuance.
+     */
+    sm2_pki_error_t sm2_pki_cert_authorize_request(
+        sm2_pki_service_ctx_t *ctx, const sm2_ic_cert_request_t *request);
 
     sm2_pki_error_t sm2_pki_cert_issue(sm2_pki_service_ctx_t *ctx,
-        const sm2_ic_cert_request_t *request, sm2_ic_cert_result_t *result);
+        const sm2_ic_cert_request_t *request, uint64_t now_ts,
+        sm2_ic_cert_result_t *result);
 
-    sm2_pki_error_t sm2_pki_service_revoke_cert(
+    sm2_pki_error_t sm2_pki_service_revoke(
         sm2_pki_service_ctx_t *ctx, uint64_t serial_number, uint64_t now_ts);
 
-    sm2_pki_error_t sm2_pki_revoke_check(sm2_pki_service_ctx_t *ctx,
+    sm2_pki_error_t sm2_pki_service_check_revocation(sm2_pki_service_ctx_t *ctx,
         uint64_t serial_number, uint64_t now_ts, sm2_rev_status_t *status,
         sm2_rev_source_t *source);
 

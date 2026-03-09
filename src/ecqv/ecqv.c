@@ -9,7 +9,6 @@
 
 #include "sm2_implicit_cert.h"
 #include <string.h>
-#include <time.h>
 #include <openssl/evp.h>
 #include <openssl/ec.h>
 #include <openssl/bn.h>
@@ -80,6 +79,20 @@ static sm2_ic_error_t utils_rand_scalar_nonzero(
 static int utils_valid_field_mask(uint16_t field_mask)
 {
     return (field_mask & (uint16_t)(~SM2_IC_FIELD_MASK_ALL)) == 0;
+}
+
+static int utils_valid_key_usage(uint8_t key_usage)
+{
+    const uint8_t allowed_mask = SM2_KU_DIGITAL_SIGNATURE
+        | SM2_KU_NON_REPUDIATION | SM2_KU_KEY_ENCIPHERMENT
+        | SM2_KU_DATA_ENCIPHERMENT | SM2_KU_KEY_AGREEMENT;
+    return key_usage != 0 && (key_usage & (uint8_t)(~allowed_mask)) == 0;
+}
+
+static sm2_ic_error_t utils_require_secure_field_mask(uint16_t field_mask)
+{
+    return field_mask == SM2_IC_FIELD_MASK_ALL ? SM2_IC_SUCCESS
+                                               : SM2_IC_ERR_PARAM;
 }
 
 static int utils_field_enabled(uint16_t mask, uint16_t field_bit)
@@ -271,6 +284,8 @@ sm2_ic_error_t sm2_ic_issue_ctx_set_field_mask(
     {
         return SM2_IC_ERR_PARAM;
     }
+    if (utils_require_secure_field_mask(field_mask) != SM2_IC_SUCCESS)
+        return SM2_IC_ERR_PARAM;
     ctx->field_mask = field_mask;
     return SM2_IC_SUCCESS;
 }
@@ -280,6 +295,26 @@ uint16_t sm2_ic_issue_ctx_get_field_mask(const sm2_ic_issue_ctx_t *ctx)
     if (!ctx)
         return SM2_IC_FIELD_MASK_ALL;
     return ctx->field_mask;
+}
+
+static sm2_ic_error_t utils_ca_public_key_matches_private(
+    const sm2_private_key_t *ca_private_key,
+    const sm2_ec_point_t *ca_public_key)
+{
+    sm2_ec_point_t derived;
+
+    if (!ca_private_key || !ca_public_key)
+        return SM2_IC_ERR_PARAM;
+
+    if (sm2_ic_sm2_point_mult(&derived, ca_private_key->d, SM2_KEY_LEN, NULL)
+        != SM2_IC_SUCCESS)
+    {
+        return SM2_IC_ERR_CRYPTO;
+    }
+
+    return memcmp(&derived, ca_public_key, sizeof(derived)) == 0
+        ? SM2_IC_SUCCESS
+        : SM2_IC_ERR_VERIFY;
 }
 
 /* ========================================== */
@@ -293,6 +328,8 @@ sm2_ic_error_t sm2_ic_create_cert_request(sm2_ic_cert_request_t *request,
     if (!request || !subject_id || !temp_private_key)
         return SM2_IC_ERR_PARAM;
     if (subject_id_len > sizeof(request->subject_id))
+        return SM2_IC_ERR_PARAM;
+    if (!utils_valid_key_usage(key_usage))
         return SM2_IC_ERR_PARAM;
 
     memset(request, 0, sizeof(*request));
@@ -354,11 +391,12 @@ clean_up:
 sm2_ic_error_t sm2_ic_ca_generate_cert_with_ctx(sm2_ic_cert_result_t *result,
     const sm2_ic_cert_request_t *request, const uint8_t *issuer_id,
     size_t issuer_id_len, const sm2_private_key_t *ca_private_key,
-    const sm2_ec_point_t *ca_public_key, const sm2_ic_issue_ctx_t *issue_ctx)
+    const sm2_ec_point_t *ca_public_key, const sm2_ic_issue_ctx_t *issue_ctx,
+    uint64_t now_ts)
 {
-    (void)ca_public_key;
-    if (!result || !request || !ca_private_key)
+    if (!result || !request || !ca_private_key || !ca_public_key)
         return SM2_IC_ERR_PARAM;
+    memset(result, 0, sizeof(*result));
     if (request->subject_id_len > sizeof(result->cert.subject_id))
         return SM2_IC_ERR_PARAM;
     if (issuer_id_len > sizeof(result->cert.issuer_id))
@@ -367,13 +405,22 @@ sm2_ic_error_t sm2_ic_ca_generate_cert_with_ctx(sm2_ic_cert_result_t *result,
         return SM2_IC_ERR_PARAM;
     if (issue_ctx && !utils_valid_field_mask(issue_ctx->field_mask))
         return SM2_IC_ERR_PARAM;
+    if (issue_ctx
+        && utils_require_secure_field_mask(issue_ctx->field_mask)
+            != SM2_IC_SUCCESS)
+    {
+        return SM2_IC_ERR_PARAM;
+    }
+
+    sm2_ic_error_t ret
+        = utils_ca_public_key_matches_private(ca_private_key, ca_public_key);
+    if (ret != SM2_IC_SUCCESS)
+        return ret;
 
     EC_GROUP *group = utils_get_sm2_group();
     BN_CTX *ctx = BN_CTX_new();
     const BIGNUM *order = group ? EC_GROUP_get0_order(group) : NULL;
     uint64_t serial = 0;
-    time_t now_ts = 0;
-
     BIGNUM *k = BN_new();
     BIGNUM *d_ca = utils_bin_to_bn(ca_private_key->d, 32);
     EC_POINT *X = group ? EC_POINT_new(group) : NULL;
@@ -382,7 +429,7 @@ sm2_ic_error_t sm2_ic_ca_generate_cert_with_ctx(sm2_ic_cert_result_t *result,
     BIGNUM *s = BN_new();
     EC_POINT *kG = group ? EC_POINT_new(group) : NULL;
     BIGNUM *tmp = BN_new();
-    sm2_ic_error_t ret = SM2_IC_ERR_CRYPTO;
+    ret = SM2_IC_ERR_CRYPTO;
 
     if (!group || !ctx || !order || !k || !d_ca || !X || !V || !h || !s || !kG
         || !tmp)
@@ -390,10 +437,6 @@ sm2_ic_error_t sm2_ic_ca_generate_cert_with_ctx(sm2_ic_cert_result_t *result,
         ret = SM2_IC_ERR_MEMORY;
         goto clean_up;
     }
-
-    now_ts = time(NULL);
-    if (now_ts < 0)
-        goto clean_up;
 
     /* Import Ephemeral Key X */
     uint8_t point_buf[65];
@@ -446,7 +489,7 @@ sm2_ic_error_t sm2_ic_ca_generate_cert_with_ctx(sm2_ic_cert_result_t *result,
 
     if (utils_field_enabled(mask, SM2_IC_FIELD_VALID_FROM))
     {
-        result->cert.valid_from = (uint64_t)now_ts;
+        result->cert.valid_from = now_ts;
     }
     else
     {
@@ -512,12 +555,12 @@ clean_up:
 sm2_ic_error_t sm2_ic_ca_generate_cert(sm2_ic_cert_result_t *result,
     const sm2_ic_cert_request_t *request, const uint8_t *issuer_id,
     size_t issuer_id_len, const sm2_private_key_t *ca_private_key,
-    const sm2_ec_point_t *ca_public_key)
+    const sm2_ec_point_t *ca_public_key, uint64_t now_ts)
 {
     sm2_ic_issue_ctx_t default_ctx;
     sm2_ic_issue_ctx_init(&default_ctx);
     return sm2_ic_ca_generate_cert_with_ctx(result, request, issuer_id,
-        issuer_id_len, ca_private_key, ca_public_key, &default_ctx);
+        issuer_id_len, ca_private_key, ca_public_key, &default_ctx, now_ts);
 }
 
 sm2_ic_error_t sm2_ic_reconstruct_keys(sm2_private_key_t *private_key,
@@ -525,10 +568,13 @@ sm2_ic_error_t sm2_ic_reconstruct_keys(sm2_private_key_t *private_key,
     const sm2_private_key_t *temp_private_key,
     const sm2_ec_point_t *ca_public_key)
 {
-    if (!private_key || !public_key || !cert_result || !temp_private_key)
+    if (!private_key || !public_key || !cert_result || !temp_private_key
+        || !ca_public_key)
+    {
         return SM2_IC_ERR_PARAM;
-
-    (void)ca_public_key;
+    }
+    memset(private_key, 0, sizeof(*private_key));
+    memset(public_key, 0, sizeof(*public_key));
     EC_GROUP *group = utils_get_sm2_group();
     BN_CTX *ctx = BN_CTX_new();
     const BIGNUM *order = group ? EC_GROUP_get0_order(group) : NULL;
@@ -573,9 +619,14 @@ sm2_ic_error_t sm2_ic_reconstruct_keys(sm2_private_key_t *private_key,
     }
     memcpy(public_key->x, point_buf + 1, 32);
     memcpy(public_key->y, point_buf + 33, 32);
-    ret = SM2_IC_SUCCESS;
+    ret = sm2_ic_verify_cert(&cert_result->cert, public_key, ca_public_key);
 
 clean_up:
+    if (ret != SM2_IC_SUCCESS)
+    {
+        memset(private_key, 0, sizeof(*private_key));
+        memset(public_key, 0, sizeof(*public_key));
+    }
     EC_GROUP_free(group);
     BN_CTX_free(ctx);
     BN_clear_free(x);
@@ -592,6 +643,13 @@ sm2_ic_error_t sm2_ic_verify_cert(const sm2_implicit_cert_t *cert,
 {
     if (!cert || !public_key || !ca_public_key)
         return SM2_IC_ERR_PARAM;
+    if (cert->type != SM2_CERT_TYPE_IMPLICIT)
+        return SM2_IC_ERR_VERIFY;
+    if ((cert->field_mask & SM2_IC_FIELD_KEY_USAGE) != 0
+        && !utils_valid_key_usage(cert->key_usage))
+    {
+        return SM2_IC_ERR_VERIFY;
+    }
 
     EC_GROUP *group = utils_get_sm2_group();
     BN_CTX *ctx = BN_CTX_new();
@@ -788,6 +846,15 @@ sm2_ic_error_t sm2_ic_cbor_encode_cert(
     {
         return SM2_IC_ERR_PARAM;
     }
+    if (cert->type != SM2_CERT_TYPE_IMPLICIT)
+    {
+        return SM2_IC_ERR_PARAM;
+    }
+    if ((mask & SM2_IC_FIELD_KEY_USAGE) != 0
+        && !utils_valid_key_usage(cert->key_usage))
+    {
+        return SM2_IC_ERR_PARAM;
+    }
 
     const size_t cap = *output_len;
     size_t offset = 0;
@@ -883,6 +950,8 @@ sm2_ic_error_t sm2_ic_cbor_decode_cert(
         != SM2_IC_SUCCESS)
         return SM2_IC_ERR_CBOR;
     cert->type = (uint8_t)val;
+    if (cert->type != SM2_CERT_TYPE_IMPLICIT)
+        return SM2_IC_ERR_CBOR;
 
     if (utils_cbor_read_head(input, input_len, &offset, 0, &val)
         != SM2_IC_SUCCESS)
@@ -952,6 +1021,8 @@ sm2_ic_error_t sm2_ic_cbor_decode_cert(
         if (val > UINT8_MAX)
             return SM2_IC_ERR_CBOR;
         cert->key_usage = (uint8_t)val;
+        if (!utils_valid_key_usage(cert->key_usage))
+            return SM2_IC_ERR_CBOR;
     }
 
     if (utils_cbor_read_head(input, input_len, &offset, 2, &val)

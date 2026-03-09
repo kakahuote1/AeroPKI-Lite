@@ -2,15 +2,19 @@
 
 /**
  * @file main.c
- * @brief Aviation PKI Demo Application.
- * @details Demonstrates the full lifecycle of SM2 Implicit Certificates.
+ * @brief TinyPKI ECQV demo application.
+ * @details
+ * Demonstrates the full lifecycle of SM2 Implicit Certificates.
  */
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 #include "sm2_implicit_cert.h"
+#include "sm2_auth.h"
 
 /* ANSI Color Codes */
 #define CLR_RESET "\033[0m"
@@ -42,14 +46,19 @@ static void log_point(const char *label, const sm2_ec_point_t *point)
     printf("%s\n", CLR_RESET);
 }
 
+static void log_redacted_secret(const char *label)
+{
+    printf("    %-24s: %s[redacted]%s\n", label, CLR_YELLOW, CLR_RESET);
+}
+
 int main()
 {
-#ifdef _WIN32
-    system("chcp 65001 > nul");
+#if defined(_WIN32)
+    SetConsoleCP(CP_UTF8);
+    SetConsoleOutputCP(CP_UTF8);
 #endif
 
-    printf("\n%s=== Aviation Lightweight PKI Demo (SM2-ECQV) ===%s\n\n",
-        CLR_CYAN, CLR_RESET);
+    printf("\n%s=== TinyPKI ECQV Demo ===%s\n\n", CLR_CYAN, CLR_RESET);
 
     sm2_ic_error_t ret;
     clock_t start_time, end_time;
@@ -59,16 +68,16 @@ int main()
 
     sm2_private_key_t ca_priv;
     sm2_ec_point_t ca_pub;
+    uint64_t issue_now = (uint64_t)time(NULL);
 
-    if (sm2_ic_generate_random(ca_priv.d, 32) != SM2_IC_SUCCESS
-        || sm2_ic_sm2_point_mult(&ca_pub, ca_priv.d, 32, NULL)
-            != SM2_IC_SUCCESS)
+    if (sm2_auth_generate_ephemeral_keypair(&ca_priv, &ca_pub)
+        != SM2_IC_SUCCESS)
     {
         fprintf(stderr, "%s[ERROR] Failed to generate CA keys.\n%s", CLR_RED,
             CLR_RESET);
         return -1;
     }
-    log_hex("CA Private Key (d)", ca_priv.d, 32);
+    log_redacted_secret("CA Private Key");
     log_point("CA Public Key (P)", &ca_pub);
     printf("\n");
 
@@ -90,7 +99,7 @@ int main()
         return -1;
     }
 
-    log_hex("Ephemeral Priv Key (r)", temp_device_priv.d, 32);
+    log_redacted_secret("Ephemeral Priv Key");
     log_point("Ephemeral Pub Key (R)", &req.temp_public_key);
     printf("    Subject ID              : %.*s\n\n", (int)req.subject_id_len,
         req.subject_id);
@@ -100,11 +109,11 @@ int main()
         CLR_RESET);
 
     sm2_ic_cert_result_t issue_result;
-    const char *issuer_id = "Aviation-Root-CA-G1";
+    const char *issuer_id = "TinyPKI-Root-CA-G1";
 
     start_time = clock();
     ret = sm2_ic_ca_generate_cert(&issue_result, &req, (uint8_t *)issuer_id,
-        strlen(issuer_id), &ca_priv, &ca_pub);
+        strlen(issuer_id), &ca_priv, &ca_pub, issue_now);
     end_time = clock();
 
     if (ret != SM2_IC_SUCCESS)
@@ -121,7 +130,7 @@ int main()
         "    Field Mask              : 0x%04X\n", issue_result.cert.field_mask);
     log_hex("Reconstruction Key (V)", issue_result.cert.public_recon_key,
         SM2_COMPRESSED_KEY_LEN);
-    log_hex("Priv Recon Data (s)", issue_result.private_recon_value, 32);
+    log_redacted_secret("Reconstruction Scalar (s)");
     printf("\n");
 
     /* --- Phase 3: Performance Metrics --- */
@@ -131,27 +140,29 @@ int main()
     size_t cbor_len = sizeof(cbor_buf);
 
     if (sm2_ic_cbor_encode_cert(cbor_buf, &cbor_len, &issue_result.cert)
-        == SM2_IC_SUCCESS)
+        != SM2_IC_SUCCESS)
     {
-        float ratio_x509
-            = (1.0f - (float)cbor_len / (float)BASELINE_X509_DER_SIZE) * 100.0f;
-
-        log_hex("CBOR Payload", cbor_buf, cbor_len);
-        printf("\n");
-        printf("  +-----------------------------+------------------------+\n");
-        printf("  | Metric                      | Value                  |\n");
-        printf("  +-----------------------------+------------------------+\n");
-        printf("  | Standard X.509 DER Baseline | %4d Bytes             |\n",
-            BASELINE_X509_DER_SIZE);
-        printf(
-            "  | ECQV Implicit Cert (CBOR)   | %s%4zu Bytes%s             |\n",
-            CLR_GREEN, cbor_len, CLR_RESET);
-        printf("  +-----------------------------+------------------------+\n");
-        printf(
-            "  | Space Savings               | %s%.2f%%%s                 |\n",
-            CLR_YELLOW, ratio_x509, CLR_RESET);
-        printf("  +-----------------------------+------------------------+\n");
+        fprintf(
+            stderr, "%s[ERROR] CBOR encoding failed.\n%s", CLR_RED, CLR_RESET);
+        return -1;
     }
+
+    float ratio_x509
+        = (1.0f - (float)cbor_len / (float)BASELINE_X509_DER_SIZE) * 100.0f;
+
+    log_hex("CBOR Payload", cbor_buf, cbor_len);
+    printf("\n");
+    printf("  +-----------------------------+------------------------+\n");
+    printf("  | Metric                      | Value                  |\n");
+    printf("  +-----------------------------+------------------------+\n");
+    printf("  | Standard X.509 DER Baseline | %4d Bytes             |\n",
+        BASELINE_X509_DER_SIZE);
+    printf("  | ECQV Implicit Cert (CBOR)   | %s%4zu Bytes%s             |\n",
+        CLR_GREEN, cbor_len, CLR_RESET);
+    printf("  +-----------------------------+------------------------+\n");
+    printf("  | Space Savings               | %s%.2f%%%s                 |\n",
+        CLR_YELLOW, ratio_x509, CLR_RESET);
+    printf("  +-----------------------------+------------------------+\n");
     printf("\n");
 
     /* --- Phase 4: Key Reconstruction --- */
@@ -161,9 +172,15 @@ int main()
     sm2_private_key_t final_device_priv;
     sm2_ec_point_t final_device_pub;
     sm2_implicit_cert_t received_cert;
+    memset(&received_cert, 0, sizeof(received_cert));
 
-    sm2_ic_cbor_decode_cert(
-        &received_cert, cbor_buf, cbor_len); /* Simulate network transmission */
+    if (sm2_ic_cbor_decode_cert(&received_cert, cbor_buf, cbor_len)
+        != SM2_IC_SUCCESS)
+    {
+        fprintf(
+            stderr, "%s[ERROR] CBOR decoding failed.\n%s", CLR_RED, CLR_RESET);
+        return -1;
+    }
 
     if (sm2_ic_reconstruct_keys(&final_device_priv, &final_device_pub,
             &issue_result, &temp_device_priv, &ca_pub)
@@ -174,7 +191,7 @@ int main()
         return -1;
     }
 
-    log_hex("Recovered Priv Key (d)", final_device_priv.d, 32);
+    log_redacted_secret("Recovered Priv Key");
     log_point("Derived Pub Key (Q)", &final_device_pub);
     printf("\n");
 

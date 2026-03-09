@@ -1,4 +1,4 @@
-﻿/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-License-Identifier: Apache-2.0 */
 
 /**
  * @file sm2_auth.c
@@ -6,6 +6,7 @@
  */
 
 #include "sm2_auth.h"
+#include "sm2_revocation.h"
 #include "sm2_secure_mem.h"
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,66 @@ typedef struct
     uint8_t key_raw[SM2_KEY_LEN * 2];
     EVP_PKEY *pkey;
 } verify_key_cache_t;
+
+static void utils_bn_to_fixed_bin(const BIGNUM *value, uint8_t out[SM2_KEY_LEN])
+{
+    if (!out)
+        return;
+
+    memset(out, 0, SM2_KEY_LEN);
+    if (!value)
+        return;
+
+    int value_len = BN_num_bytes(value);
+    if (value_len <= 0)
+        return;
+    if (value_len > SM2_KEY_LEN)
+        value_len = SM2_KEY_LEN;
+
+    BN_bn2bin(value, out + (SM2_KEY_LEN - value_len));
+}
+
+static sm2_ic_error_t utils_generate_sm2_private_scalar(
+    sm2_private_key_t *private_key)
+{
+    if (!private_key)
+        return SM2_IC_ERR_PARAM;
+
+    EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_sm2);
+    BIGNUM *order = BN_new();
+    BIGNUM *scalar = BN_new();
+    sm2_ic_error_t ret = SM2_IC_ERR_CRYPTO;
+
+    sm2_secure_memzero(private_key, sizeof(*private_key));
+
+    if (!group || !order || !scalar)
+    {
+        ret = SM2_IC_ERR_MEMORY;
+        goto cleanup;
+    }
+    if (EC_GROUP_get_order(group, order, NULL) != 1)
+        goto cleanup;
+
+    for (size_t i = 0; i < 64; i++)
+    {
+        if (BN_rand_range(scalar, order) != 1)
+            goto cleanup;
+        if (BN_is_zero(scalar))
+            continue;
+
+        utils_bn_to_fixed_bin(scalar, private_key->d);
+        ret = SM2_IC_SUCCESS;
+        break;
+    }
+
+cleanup:
+    if (ret != SM2_IC_SUCCESS)
+        sm2_secure_memzero(private_key, sizeof(*private_key));
+    BN_clear_free(scalar);
+    BN_free(order);
+    EC_GROUP_free(group);
+    return ret;
+}
 
 static EVP_PKEY *utils_pkey_from_public(const sm2_ec_point_t *public_key)
 {
@@ -304,17 +365,38 @@ static sm2_ic_error_t utils_validate_keypair(
     return SM2_IC_SUCCESS;
 }
 
-static const EVP_CIPHER *utils_sm4_aead_cipher(sm2_auth_aead_mode_t mode)
+static const char *utils_aead_cipher_name(sm2_auth_aead_mode_t mode)
 {
     switch (mode)
     {
         case SM2_AUTH_AEAD_MODE_SM4_GCM:
-            return EVP_get_cipherbyname("SM4-GCM");
+            return "SM4-GCM";
         case SM2_AUTH_AEAD_MODE_SM4_CCM:
-            return EVP_get_cipherbyname("SM4-CCM");
+            return "SM4-CCM";
         default:
             return NULL;
     }
+}
+
+static EVP_CIPHER *utils_aead_cipher_load(sm2_auth_aead_mode_t mode)
+{
+    const char *cipher_name = utils_aead_cipher_name(mode);
+    if (!cipher_name)
+        return NULL;
+#if OPENSSL_VERSION_MAJOR >= 3
+    return EVP_CIPHER_fetch(NULL, cipher_name, NULL);
+#else
+    return (EVP_CIPHER *)EVP_get_cipherbyname(cipher_name);
+#endif
+}
+
+static void utils_aead_cipher_free(EVP_CIPHER *cipher)
+{
+#if OPENSSL_VERSION_MAJOR >= 3
+    EVP_CIPHER_free(cipher);
+#else
+    (void)cipher;
+#endif
 }
 
 static bool utils_size_to_int(size_t value, int *out)
@@ -324,58 +406,15 @@ static bool utils_size_to_int(size_t value, int *out)
     *out = (int)value;
     return true;
 }
-static sm2_ic_error_t utils_sm4_crypt_ctr(int encrypt, const uint8_t key[16],
-    const uint8_t iv[16], const uint8_t *input, size_t input_len,
-    uint8_t *output, size_t *output_len)
-{
-    if (!key || !iv || !input || !output || !output_len)
-        return SM2_IC_ERR_PARAM;
-    if (*output_len < input_len)
-        return SM2_IC_ERR_MEMORY;
 
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx)
-        return SM2_IC_ERR_CRYPTO;
-
-    int len = 0;
-    int total = 0;
-    int ok = 1;
-    if (encrypt)
-    {
-        ok = EVP_EncryptInit_ex(ctx, EVP_sm4_ctr(), NULL, key, iv);
-        if (ok == 1)
-            ok = EVP_EncryptUpdate(ctx, output, &len, input, (int)input_len);
-        total = len;
-        if (ok == 1)
-            ok = EVP_EncryptFinal_ex(ctx, output + total, &len);
-        total += len;
-    }
-    else
-    {
-        ok = EVP_DecryptInit_ex(ctx, EVP_sm4_ctr(), NULL, key, iv);
-        if (ok == 1)
-            ok = EVP_DecryptUpdate(ctx, output, &len, input, (int)input_len);
-        total = len;
-        if (ok == 1)
-            ok = EVP_DecryptFinal_ex(ctx, output + total, &len);
-        total += len;
-    }
-
-    EVP_CIPHER_CTX_free(ctx);
-    if (ok != 1)
-        return SM2_IC_ERR_CRYPTO;
-    *output_len = (size_t)total;
-    return SM2_IC_SUCCESS;
-}
-
-sm2_ic_error_t sm2_auth_precompute_pool_init(sm2_auth_precompute_pool_t *pool,
+sm2_ic_error_t sm2_auth_sign_pool_init(sm2_auth_sign_pool_t *pool,
     const sm2_private_key_t *signing_key, size_t capacity)
 {
     if (!pool || !signing_key || capacity == 0)
         return SM2_IC_ERR_PARAM;
     memset(pool, 0, sizeof(*pool));
-    pool->slots = (sm2_auth_precomp_slot_t *)calloc(
-        capacity, sizeof(sm2_auth_precomp_slot_t));
+    pool->slots = (sm2_auth_sign_slot_t *)calloc(
+        capacity, sizeof(sm2_auth_sign_slot_t));
     if (!pool->slots)
         return SM2_IC_ERR_MEMORY;
 
@@ -393,7 +432,7 @@ sm2_ic_error_t sm2_auth_precompute_pool_init(sm2_auth_precompute_pool_t *pool,
     return SM2_IC_SUCCESS;
 }
 
-void sm2_auth_precompute_pool_cleanup(sm2_auth_precompute_pool_t *pool)
+void sm2_auth_sign_pool_cleanup(sm2_auth_sign_pool_t *pool)
 {
     if (!pool)
         return;
@@ -405,14 +444,13 @@ void sm2_auth_precompute_pool_cleanup(sm2_auth_precompute_pool_t *pool)
     sm2_secure_memzero(pool, sizeof(*pool));
 }
 
-size_t sm2_auth_precompute_pool_available(
-    const sm2_auth_precompute_pool_t *pool)
+size_t sm2_auth_sign_pool_available(const sm2_auth_sign_pool_t *pool)
 {
     return pool ? pool->available : 0;
 }
 
-sm2_ic_error_t sm2_auth_precompute_pool_fill(
-    sm2_auth_precompute_pool_t *pool, size_t target_available)
+sm2_ic_error_t sm2_auth_sign_pool_fill(
+    sm2_auth_sign_pool_t *pool, size_t target_available)
 {
     if (!pool || !pool->slots)
         return SM2_IC_ERR_PARAM;
@@ -458,7 +496,7 @@ sm2_ic_error_t sm2_auth_sign(const sm2_private_key_t *signing_key,
     return ret;
 }
 
-sm2_ic_error_t sm2_auth_sign_with_pool(sm2_auth_precompute_pool_t *pool,
+sm2_ic_error_t sm2_auth_sign_with_pool(sm2_auth_sign_pool_t *pool,
     const uint8_t *message, size_t message_len, sm2_auth_signature_t *signature)
 {
     if (!pool || !message || !signature)
@@ -641,7 +679,24 @@ sm2_ic_error_t sm2_auth_verify_cert_with_store(const sm2_implicit_cert_t *cert,
     return SM2_IC_ERR_VERIFY;
 }
 
-#define SM2_AUTH_UNIX_TS_MIN 1000000000ULL
+void sm2_auth_request_init(sm2_auth_request_t *request)
+{
+    if (!request)
+        return;
+    memset(request, 0, sizeof(*request));
+}
+
+static sm2_ic_error_t auth_require_cert_key_usage(
+    const sm2_implicit_cert_t *cert, uint8_t required_usage)
+{
+    if (!cert)
+        return SM2_IC_ERR_PARAM;
+    if ((cert->field_mask & SM2_IC_FIELD_KEY_USAGE) == 0)
+        return SM2_IC_ERR_VERIFY;
+    if ((cert->key_usage & required_usage) != required_usage)
+        return SM2_IC_ERR_VERIFY;
+    return SM2_IC_SUCCESS;
+}
 
 static sm2_ic_error_t auth_check_cert_policy(
     const sm2_implicit_cert_t *cert, uint64_t now_ts)
@@ -649,11 +704,9 @@ static sm2_ic_error_t auth_check_cert_policy(
     if (!cert)
         return SM2_IC_ERR_PARAM;
 
-    if ((cert->field_mask & SM2_IC_FIELD_KEY_USAGE) != 0
-        && (cert->key_usage & SM2_KU_DIGITAL_SIGNATURE) == 0)
-    {
+    if (auth_require_cert_key_usage(cert, SM2_KU_DIGITAL_SIGNATURE)
+        != SM2_IC_SUCCESS)
         return SM2_IC_ERR_VERIFY;
-    }
 
     bool has_valid_from = (cert->field_mask & SM2_IC_FIELD_VALID_FROM) != 0;
     bool has_valid_duration
@@ -661,32 +714,45 @@ static sm2_ic_error_t auth_check_cert_policy(
 
     if (has_valid_from != has_valid_duration)
         return SM2_IC_ERR_VERIFY;
+    if (!has_valid_from)
+        return SM2_IC_ERR_VERIFY;
 
     if (has_valid_from && has_valid_duration)
     {
-        bool mixed_timescale = now_ts < SM2_AUTH_UNIX_TS_MIN
-            && cert->valid_from >= SM2_AUTH_UNIX_TS_MIN;
-        if (!mixed_timescale)
-        {
-            if (now_ts < cert->valid_from)
-                return SM2_IC_ERR_VERIFY;
+        if (now_ts < cert->valid_from)
+            return SM2_IC_ERR_VERIFY;
 
-            uint64_t valid_to = cert->valid_from;
-            if (cert->valid_duration <= UINT64_MAX - valid_to)
-                valid_to += cert->valid_duration;
-            else
-                valid_to = UINT64_MAX;
+        uint64_t valid_to = cert->valid_from;
+        if (cert->valid_duration <= UINT64_MAX - valid_to)
+            valid_to += cert->valid_duration;
+        else
+            valid_to = UINT64_MAX;
 
-            if (now_ts > valid_to)
-                return SM2_IC_ERR_VERIFY;
-        }
+        if (now_ts > valid_to)
+            return SM2_IC_ERR_VERIFY;
+    }
+
+    return SM2_IC_SUCCESS;
+}
+
+static sm2_ic_error_t auth_validate_revocation_source(
+    const sm2_auth_request_t *request, sm2_rev_status_t status,
+    sm2_rev_source_t source)
+{
+    if (!request)
+        return SM2_IC_ERR_PARAM;
+
+    if (status == SM2_REV_STATUS_GOOD && source == SM2_REV_SOURCE_LOCAL_STATE
+        && !request->allow_local_revocation_state)
+    {
+        return SM2_IC_ERR_VERIFY;
     }
 
     return SM2_IC_SUCCESS;
 }
 
 sm2_ic_error_t sm2_auth_authenticate_request(const sm2_auth_request_t *request,
-    const sm2_auth_trust_store_t *store, sm2_revocation_ctx_t *rev_ctx,
+    const sm2_auth_trust_store_t *store, sm2_rev_ctx_t *rev_ctx,
     uint64_t now_ts, size_t *matched_ca_index)
 {
     if (!request || !request->cert || !request->public_key
@@ -711,6 +777,11 @@ sm2_ic_error_t sm2_auth_authenticate_request(const sm2_auth_request_t *request,
 
     if (request->lightweight_mode && !request->revocation_query_fn)
         return SM2_IC_ERR_VERIFY;
+    if (!request->lightweight_mode && !request->revocation_query_fn && !rev_ctx
+        && !request->allow_missing_revocation_check)
+    {
+        return SM2_IC_ERR_VERIFY;
+    }
 
     sm2_ic_error_t ret = sm2_auth_verify_cert_with_store(
         request->cert, request->public_key, store, matched_ca_index);
@@ -737,9 +808,13 @@ sm2_ic_error_t sm2_auth_authenticate_request(const sm2_auth_request_t *request,
             sm2_rev_source_t local_source = SM2_REV_SOURCE_NONE;
             if (!rev_ctx)
                 return SM2_IC_ERR_VERIFY;
-            ret = sm2_revocation_query(rev_ctx, request->cert->serial_number,
-                now_ts, &local_status, &local_source);
+            ret = sm2_rev_query(rev_ctx, request->cert->serial_number, now_ts,
+                &local_status, &local_source);
             (void)local_source;
+            if (ret != SM2_IC_SUCCESS)
+                return ret;
+            ret = auth_validate_revocation_source(
+                request, local_status, local_source);
             if (ret != SM2_IC_SUCCESS)
                 return ret;
             if (local_status != SM2_REV_STATUS_GOOD)
@@ -750,9 +825,11 @@ sm2_ic_error_t sm2_auth_authenticate_request(const sm2_auth_request_t *request,
             && rev_ctx)
         {
             sm2_rev_source_t source = SM2_REV_SOURCE_NONE;
-            ret = sm2_revocation_query(rev_ctx, request->cert->serial_number,
-                now_ts, &status, &source);
-            (void)source;
+            ret = sm2_rev_query(rev_ctx, request->cert->serial_number, now_ts,
+                &status, &source);
+            if (ret != SM2_IC_SUCCESS)
+                return ret;
+            ret = auth_validate_revocation_source(request, status, source);
             if (ret != SM2_IC_SUCCESS)
                 return ret;
         }
@@ -764,9 +841,11 @@ sm2_ic_error_t sm2_auth_authenticate_request(const sm2_auth_request_t *request,
     {
         sm2_rev_status_t status = SM2_REV_STATUS_UNKNOWN;
         sm2_rev_source_t source = SM2_REV_SOURCE_NONE;
-        ret = sm2_revocation_query(
+        ret = sm2_rev_query(
             rev_ctx, request->cert->serial_number, now_ts, &status, &source);
-        (void)source;
+        if (ret != SM2_IC_SUCCESS)
+            return ret;
+        ret = auth_validate_revocation_source(request, status, source);
         if (ret != SM2_IC_SUCCESS)
             return ret;
         if (status != SM2_REV_STATUS_GOOD)
@@ -781,7 +860,7 @@ sm2_ic_error_t sm2_auth_authenticate_request(const sm2_auth_request_t *request,
         request->message_len, request->signature);
 }
 
-sm2_ic_error_t sm2_auth_derive_session_key(
+sm2_ic_error_t sm2_auth_derive_session_key_static(
     const sm2_private_key_t *local_private_key,
     const sm2_ec_point_t *peer_public_key, uint8_t *session_key,
     size_t session_key_len)
@@ -803,14 +882,13 @@ sm2_ic_error_t sm2_auth_derive_session_key(
     sm2_secure_memzero(shared_xy, sizeof(shared_xy));
     return ret;
 }
-sm2_ic_error_t sm2_auth_mutual_auth_and_key_agreement(
+sm2_ic_error_t sm2_auth_mutual_handshake_static(
     const sm2_auth_request_t *a_to_b, const sm2_private_key_t *a_private_key,
-    const sm2_auth_trust_store_t *b_trust_store,
-    sm2_revocation_ctx_t *b_rev_ctx, const sm2_auth_request_t *b_to_a,
-    const sm2_private_key_t *b_private_key,
-    const sm2_auth_trust_store_t *a_trust_store,
-    sm2_revocation_ctx_t *a_rev_ctx, uint64_t now_ts, uint8_t *session_key_a,
-    uint8_t *session_key_b, size_t session_key_len)
+    const sm2_auth_trust_store_t *b_trust_store, sm2_rev_ctx_t *b_rev_ctx,
+    const sm2_auth_request_t *b_to_a, const sm2_private_key_t *b_private_key,
+    const sm2_auth_trust_store_t *a_trust_store, sm2_rev_ctx_t *a_rev_ctx,
+    uint64_t now_ts, uint8_t *session_key_a, uint8_t *session_key_b,
+    size_t session_key_len)
 {
     if (!a_to_b || !b_to_a || !a_private_key || !b_private_key || !a_trust_store
         || !b_trust_store || !session_key_a || !session_key_b
@@ -829,11 +907,18 @@ sm2_ic_error_t sm2_auth_mutual_auth_and_key_agreement(
     if (ret != SM2_IC_SUCCESS)
         return ret;
 
-    ret = sm2_auth_derive_session_key(
+    ret = auth_require_cert_key_usage(a_to_b->cert, SM2_KU_KEY_AGREEMENT);
+    if (ret != SM2_IC_SUCCESS)
+        return ret;
+    ret = auth_require_cert_key_usage(b_to_a->cert, SM2_KU_KEY_AGREEMENT);
+    if (ret != SM2_IC_SUCCESS)
+        return ret;
+
+    ret = sm2_auth_derive_session_key_static(
         a_private_key, b_to_a->public_key, session_key_a, session_key_len);
     if (ret != SM2_IC_SUCCESS)
         return ret;
-    ret = sm2_auth_derive_session_key(
+    ret = sm2_auth_derive_session_key_static(
         b_private_key, a_to_b->public_key, session_key_b, session_key_len);
     if (ret != SM2_IC_SUCCESS)
         return ret;
@@ -853,7 +938,7 @@ sm2_ic_error_t sm2_auth_generate_ephemeral_keypair(
     for (size_t i = 0; i < 32; i++)
     {
         sm2_ic_error_t ret
-            = sm2_ic_generate_random(ephemeral_private_key->d, SM2_KEY_LEN);
+            = utils_generate_sm2_private_scalar(ephemeral_private_key);
         if (ret != SM2_IC_SUCCESS)
             return ret;
         if (utils_private_key_is_zero(ephemeral_private_key))
@@ -864,10 +949,12 @@ sm2_ic_error_t sm2_auth_generate_ephemeral_keypair(
             return SM2_IC_SUCCESS;
     }
 
+    sm2_secure_memzero(ephemeral_private_key, sizeof(*ephemeral_private_key));
+    sm2_secure_memzero(ephemeral_public_key, sizeof(*ephemeral_public_key));
     return SM2_IC_ERR_CRYPTO;
 }
 
-sm2_ic_error_t sm2_auth_derive_session_key_ephemeral(
+sm2_ic_error_t sm2_auth_derive_session_key(
     const sm2_private_key_t *local_private_key,
     const sm2_private_key_t *local_ephemeral_private_key,
     const sm2_ec_point_t *peer_public_key,
@@ -945,19 +1032,17 @@ cleanup:
     return ret;
 }
 
-sm2_ic_error_t sm2_auth_mutual_auth_and_key_agreement_v2(
-    const sm2_auth_request_t *a_to_b, const sm2_private_key_t *a_private_key,
+sm2_ic_error_t sm2_auth_mutual_handshake(const sm2_auth_request_t *a_to_b,
+    const sm2_private_key_t *a_private_key,
     const sm2_private_key_t *a_ephemeral_private_key,
     const sm2_ec_point_t *a_ephemeral_public_key,
-    const sm2_auth_trust_store_t *b_trust_store,
-    sm2_revocation_ctx_t *b_rev_ctx, const sm2_auth_request_t *b_to_a,
-    const sm2_private_key_t *b_private_key,
+    const sm2_auth_trust_store_t *b_trust_store, sm2_rev_ctx_t *b_rev_ctx,
+    const sm2_auth_request_t *b_to_a, const sm2_private_key_t *b_private_key,
     const sm2_private_key_t *b_ephemeral_private_key,
     const sm2_ec_point_t *b_ephemeral_public_key,
-    const sm2_auth_trust_store_t *a_trust_store,
-    sm2_revocation_ctx_t *a_rev_ctx, uint64_t now_ts, const uint8_t *transcript,
-    size_t transcript_len, uint8_t *session_key_a, uint8_t *session_key_b,
-    size_t session_key_len)
+    const sm2_auth_trust_store_t *a_trust_store, sm2_rev_ctx_t *a_rev_ctx,
+    uint64_t now_ts, const uint8_t *transcript, size_t transcript_len,
+    uint8_t *session_key_a, uint8_t *session_key_b, size_t session_key_len)
 {
     if (!a_to_b || !b_to_a || !a_private_key || !a_ephemeral_private_key
         || !a_ephemeral_public_key || !b_private_key || !b_ephemeral_private_key
@@ -989,15 +1074,22 @@ sm2_ic_error_t sm2_auth_mutual_auth_and_key_agreement_v2(
     if (ret != SM2_IC_SUCCESS)
         return ret;
 
-    ret = sm2_auth_derive_session_key_ephemeral(a_private_key,
-        a_ephemeral_private_key, b_to_a->public_key, b_ephemeral_public_key,
-        transcript, transcript_len, session_key_a, session_key_len);
+    ret = auth_require_cert_key_usage(a_to_b->cert, SM2_KU_KEY_AGREEMENT);
+    if (ret != SM2_IC_SUCCESS)
+        return ret;
+    ret = auth_require_cert_key_usage(b_to_a->cert, SM2_KU_KEY_AGREEMENT);
     if (ret != SM2_IC_SUCCESS)
         return ret;
 
-    ret = sm2_auth_derive_session_key_ephemeral(b_private_key,
-        b_ephemeral_private_key, a_to_b->public_key, a_ephemeral_public_key,
-        transcript, transcript_len, session_key_b, session_key_len);
+    ret = sm2_auth_derive_session_key(a_private_key, a_ephemeral_private_key,
+        b_to_a->public_key, b_ephemeral_public_key, transcript, transcript_len,
+        session_key_a, session_key_len);
+    if (ret != SM2_IC_SUCCESS)
+        return ret;
+
+    ret = sm2_auth_derive_session_key(b_private_key, b_ephemeral_private_key,
+        a_to_b->public_key, a_ephemeral_public_key, transcript, transcript_len,
+        session_key_b, session_key_len);
     if (ret != SM2_IC_SUCCESS)
         return ret;
 
@@ -1007,7 +1099,7 @@ sm2_ic_error_t sm2_auth_mutual_auth_and_key_agreement_v2(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_auth_sm4_aead_encrypt(sm2_auth_aead_mode_t mode,
+sm2_ic_error_t sm2_auth_encrypt(sm2_auth_aead_mode_t mode,
     const uint8_t key[16], const uint8_t *iv, size_t iv_len, const uint8_t *aad,
     size_t aad_len, const uint8_t *plaintext, size_t plaintext_len,
     uint8_t *ciphertext, size_t *ciphertext_len, uint8_t *tag, size_t *tag_len)
@@ -1038,13 +1130,16 @@ sm2_ic_error_t sm2_auth_sm4_aead_encrypt(sm2_auth_aead_mode_t mode,
         return SM2_IC_ERR_PARAM;
     }
 
-    const EVP_CIPHER *cipher = utils_sm4_aead_cipher(mode);
+    EVP_CIPHER *cipher = utils_aead_cipher_load(mode);
     if (!cipher)
         return SM2_IC_ERR_CRYPTO;
 
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (!ctx)
+    {
+        utils_aead_cipher_free(cipher);
         return SM2_IC_ERR_CRYPTO;
+    }
 
     int ok = 1;
     int len = 0;
@@ -1099,6 +1194,7 @@ sm2_ic_error_t sm2_auth_sm4_aead_encrypt(sm2_auth_aead_mode_t mode,
     }
 
     EVP_CIPHER_CTX_free(ctx);
+    utils_aead_cipher_free(cipher);
     if (ok != 1)
         return SM2_IC_ERR_CRYPTO;
 
@@ -1107,7 +1203,7 @@ sm2_ic_error_t sm2_auth_sm4_aead_encrypt(sm2_auth_aead_mode_t mode,
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_auth_sm4_aead_decrypt(sm2_auth_aead_mode_t mode,
+sm2_ic_error_t sm2_auth_decrypt(sm2_auth_aead_mode_t mode,
     const uint8_t key[16], const uint8_t *iv, size_t iv_len, const uint8_t *aad,
     size_t aad_len, const uint8_t *ciphertext, size_t ciphertext_len,
     const uint8_t *tag, size_t tag_len, uint8_t *plaintext,
@@ -1135,13 +1231,16 @@ sm2_ic_error_t sm2_auth_sm4_aead_decrypt(sm2_auth_aead_mode_t mode,
         return SM2_IC_ERR_PARAM;
     }
 
-    const EVP_CIPHER *cipher = utils_sm4_aead_cipher(mode);
+    EVP_CIPHER *cipher = utils_aead_cipher_load(mode);
     if (!cipher)
         return SM2_IC_ERR_CRYPTO;
 
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (!ctx)
+    {
+        utils_aead_cipher_free(cipher);
         return SM2_IC_ERR_CRYPTO;
+    }
 
     int ok = 1;
     int len = 0;
@@ -1190,24 +1289,10 @@ sm2_ic_error_t sm2_auth_sm4_aead_decrypt(sm2_auth_aead_mode_t mode,
     }
 
     EVP_CIPHER_CTX_free(ctx);
+    utils_aead_cipher_free(cipher);
     if (ok != 1)
         return SM2_IC_ERR_VERIFY;
 
     *plaintext_len = (size_t)total;
     return SM2_IC_SUCCESS;
-}
-sm2_ic_error_t sm2_auth_sm4_encrypt(const uint8_t key[16], const uint8_t iv[16],
-    const uint8_t *plaintext, size_t plaintext_len, uint8_t *ciphertext,
-    size_t *ciphertext_len)
-{
-    return utils_sm4_crypt_ctr(
-        1, key, iv, plaintext, plaintext_len, ciphertext, ciphertext_len);
-}
-
-sm2_ic_error_t sm2_auth_sm4_decrypt(const uint8_t key[16], const uint8_t iv[16],
-    const uint8_t *ciphertext, size_t ciphertext_len, uint8_t *plaintext,
-    size_t *plaintext_len)
-{
-    return utils_sm4_crypt_ctr(
-        0, key, iv, ciphertext, ciphertext_len, plaintext, plaintext_len);
 }

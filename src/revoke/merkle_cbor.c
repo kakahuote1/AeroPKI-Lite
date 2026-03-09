@@ -1,8 +1,8 @@
-﻿/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-License-Identifier: Apache-2.0 */
 
 /**
  * @file merkle_cbor.c
- * @brief CBOR codec for Merkle proof types (member, non-member, multiproof,
+ * @brief CBOR codec for Merkle proof types (member, absence, multiproof,
  *        root record, cached member, epoch directory).
  */
 
@@ -221,8 +221,8 @@ sm2_ic_error_t cbor_get_null(const uint8_t *in, size_t in_len, size_t *offset)
 }
 
 sm2_ic_error_t cbor_encode_member_proof_inner(
-    const sm2_rev_merkle_membership_proof_t *proof, uint8_t *output,
-    size_t output_cap, size_t *offset)
+    const sm2_rev_member_proof_t *proof, uint8_t *output, size_t output_cap,
+    size_t *offset)
 {
     if (!proof || !output || !offset)
         return SM2_IC_ERR_PARAM;
@@ -274,9 +274,8 @@ sm2_ic_error_t cbor_encode_member_proof_inner(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t cbor_decode_member_proof_inner(
-    sm2_rev_merkle_membership_proof_t *proof, const uint8_t *input,
-    size_t input_len, size_t *offset)
+sm2_ic_error_t cbor_decode_member_proof_inner(sm2_rev_member_proof_t *proof,
+    const uint8_t *input, size_t input_len, size_t *offset)
 {
     if (!proof || !input || !offset)
         return SM2_IC_ERR_PARAM;
@@ -341,9 +340,8 @@ sm2_ic_error_t cbor_decode_member_proof_inner(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_cbor_encode_member_proof(
-    const sm2_rev_merkle_membership_proof_t *proof, uint8_t *output,
-    size_t *output_len)
+sm2_ic_error_t sm2_rev_member_proof_encode(
+    const sm2_rev_member_proof_t *proof, uint8_t *output, size_t *output_len)
 {
     if (!proof || !output || !output_len)
         return SM2_IC_ERR_PARAM;
@@ -358,9 +356,8 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_encode_member_proof(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_cbor_decode_member_proof(
-    sm2_rev_merkle_membership_proof_t *proof, const uint8_t *input,
-    size_t input_len)
+sm2_ic_error_t sm2_rev_member_proof_decode(
+    sm2_rev_member_proof_t *proof, const uint8_t *input, size_t input_len)
 {
     if (!proof || !input)
         return SM2_IC_ERR_PARAM;
@@ -375,9 +372,8 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_member_proof(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_cbor_encode_non_member_proof(
-    const sm2_rev_merkle_non_membership_proof_t *proof, uint8_t *output,
-    size_t *output_len)
+sm2_ic_error_t sm2_rev_absence_proof_encode(
+    const sm2_rev_absence_proof_t *proof, uint8_t *output, size_t *output_len)
 {
     if (!proof || !output || !output_len)
         return SM2_IC_ERR_PARAM;
@@ -436,9 +432,8 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_encode_non_member_proof(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_cbor_decode_non_member_proof(
-    sm2_rev_merkle_non_membership_proof_t *proof, const uint8_t *input,
-    size_t input_len)
+sm2_ic_error_t sm2_rev_absence_proof_decode(
+    sm2_rev_absence_proof_t *proof, const uint8_t *input, size_t input_len)
 {
     if (!proof || !input)
         return SM2_IC_ERR_PARAM;
@@ -506,9 +501,8 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_non_member_proof(
 
     return SM2_IC_SUCCESS;
 }
-sm2_ic_error_t sm2_revocation_merkle_cbor_encode_root_record(
-    const sm2_rev_merkle_root_record_t *root_record, uint8_t *output,
-    size_t *output_len)
+sm2_ic_error_t sm2_rev_root_encode(const sm2_rev_root_record_t *root_record,
+    uint8_t *output, size_t *output_len)
 {
     if (!root_record || !output || !output_len)
         return SM2_IC_ERR_PARAM;
@@ -552,9 +546,8 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_encode_root_record(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_cbor_decode_root_record(
-    sm2_rev_merkle_root_record_t *root_record, const uint8_t *input,
-    size_t input_len)
+sm2_ic_error_t sm2_rev_root_decode(
+    sm2_rev_root_record_t *root_record, const uint8_t *input, size_t input_len)
 {
     if (!root_record || !input)
         return SM2_IC_ERR_PARAM;
@@ -603,8 +596,7 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_root_record(
 
     return SM2_IC_SUCCESS;
 }
-void sm2_revocation_merkle_multiproof_cleanup(
-    sm2_rev_merkle_multiproof_t *proof)
+static void multiproof_reset(sm2_rev_multi_proof_t *proof)
 {
     if (!proof)
         return;
@@ -612,6 +604,52 @@ void sm2_revocation_merkle_multiproof_cleanup(
     free(proof->items);
     free(proof->unique_hashes);
     memset(proof, 0, sizeof(*proof));
+}
+
+static sm2_ic_error_t multiproof_ensure(sm2_rev_multi_proof_t **proof)
+{
+    if (!proof)
+        return SM2_IC_ERR_PARAM;
+    if (!*proof)
+    {
+        *proof = (sm2_rev_multi_proof_t *)calloc(1, sizeof(**proof));
+        if (!*proof)
+            return SM2_IC_ERR_MEMORY;
+    }
+    return SM2_IC_SUCCESS;
+}
+
+static void epoch_dir_decode_reset(sm2_rev_epoch_dir_t *directory)
+{
+    if (!directory)
+        return;
+
+    free(directory->cached_hashes);
+    free(directory->patch_items);
+    memset(directory, 0, sizeof(*directory));
+}
+
+static sm2_ic_error_t epoch_dir_decode_ensure(sm2_rev_epoch_dir_t **directory)
+{
+    if (!directory)
+        return SM2_IC_ERR_PARAM;
+    if (!*directory)
+    {
+        *directory = (sm2_rev_epoch_dir_t *)calloc(1, sizeof(**directory));
+        if (!*directory)
+            return SM2_IC_ERR_MEMORY;
+    }
+    return SM2_IC_SUCCESS;
+}
+
+void sm2_rev_multi_proof_cleanup(sm2_rev_multi_proof_t **proof)
+{
+    if (!proof || !*proof)
+        return;
+
+    multiproof_reset(*proof);
+    free(*proof);
+    *proof = NULL;
 }
 
 size_t multiproof_next_pow2(size_t v)
@@ -626,9 +664,8 @@ size_t multiproof_next_pow2(size_t v)
     return n < v ? v : n;
 }
 
-sm2_ic_error_t multiproof_reserve_unique_hashes(
-    sm2_rev_merkle_multiproof_t *proof, size_t *capacity, size_t required,
-    size_t hard_limit)
+sm2_ic_error_t multiproof_reserve_unique_hashes(sm2_rev_multi_proof_t *proof,
+    size_t *capacity, size_t required, size_t hard_limit)
 {
     if (!proof || !capacity)
         return SM2_IC_ERR_PARAM;
@@ -672,7 +709,7 @@ sm2_ic_error_t multiproof_reserve_unique_hashes(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t multiproof_find_or_add_hash(sm2_rev_merkle_multiproof_t *proof,
+sm2_ic_error_t multiproof_find_or_add_hash(sm2_rev_multi_proof_t *proof,
     const uint8_t hash[SM2_REV_MERKLE_HASH_LEN], size_t *capacity,
     size_t hard_limit, uint16_t *out_ref)
 {
@@ -703,10 +740,8 @@ sm2_ic_error_t multiproof_find_or_add_hash(sm2_rev_merkle_multiproof_t *proof,
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t multiproof_expand_member(
-    const sm2_rev_merkle_multiproof_t *proof,
-    const sm2_rev_merkle_multiproof_item_t *item,
-    sm2_rev_merkle_membership_proof_t *member)
+sm2_ic_error_t multiproof_expand_member(const sm2_rev_multi_proof_t *proof,
+    const sm2_rev_multi_item_t *item, sm2_rev_member_proof_t *member)
 {
     if (!proof || !item || !member)
         return SM2_IC_ERR_PARAM;
@@ -738,9 +773,9 @@ sm2_ic_error_t multiproof_expand_member(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_build_multiproof(
-    const sm2_rev_merkle_tree_t *tree, const uint64_t *serial_numbers,
-    size_t serial_count, sm2_rev_merkle_multiproof_t *proof)
+sm2_ic_error_t sm2_rev_multi_proof_build(const sm2_rev_tree_t *tree,
+    const uint64_t *serial_numbers, size_t serial_count,
+    sm2_rev_multi_proof_t **proof)
 {
     if (!tree || !proof || !serial_numbers || serial_count == 0)
         return SM2_IC_ERR_PARAM;
@@ -749,26 +784,30 @@ sm2_ic_error_t sm2_revocation_merkle_build_multiproof(
     if (serial_count > SM2_REV_MERKLE_MULTI_MAX_QUERIES)
         return SM2_IC_ERR_PARAM;
 
-    sm2_revocation_merkle_multiproof_cleanup(proof);
+    sm2_ic_error_t ret = multiproof_ensure(proof);
+    if (ret != SM2_IC_SUCCESS)
+        return ret;
+    sm2_rev_multi_proof_t *state = *proof;
+    multiproof_reset(state);
 
-    if (serial_count > SIZE_MAX / sizeof(sm2_rev_merkle_multiproof_item_t))
+    if (serial_count > SIZE_MAX / sizeof(sm2_rev_multi_item_t))
         return SM2_IC_ERR_MEMORY;
 
-    proof->items = (sm2_rev_merkle_multiproof_item_t *)calloc(
-        serial_count, sizeof(sm2_rev_merkle_multiproof_item_t));
-    if (!proof->items)
+    state->items = (sm2_rev_multi_item_t *)calloc(
+        serial_count, sizeof(sm2_rev_multi_item_t));
+    if (!state->items)
         return SM2_IC_ERR_MEMORY;
 
     size_t hash_capacity = 0;
     if (tree->level_count > (SIZE_MAX / serial_count))
     {
-        sm2_revocation_merkle_multiproof_cleanup(proof);
+        multiproof_reset(state);
         return SM2_IC_ERR_MEMORY;
     }
     size_t hard_limit = serial_count * tree->level_count;
     if (hard_limit == 0)
     {
-        sm2_revocation_merkle_multiproof_cleanup(proof);
+        multiproof_reset(state);
         return SM2_IC_ERR_MEMORY;
     }
     if (hard_limit > ((size_t)UINT16_MAX + 1U))
@@ -778,29 +817,28 @@ sm2_ic_error_t sm2_revocation_merkle_build_multiproof(
     if (initial_capacity > hard_limit)
         initial_capacity = hard_limit;
 
-    sm2_ic_error_t reserve_ret = multiproof_reserve_unique_hashes(
-        proof, &hash_capacity, initial_capacity, hard_limit);
-    if (reserve_ret != SM2_IC_SUCCESS)
+    ret = multiproof_reserve_unique_hashes(
+        state, &hash_capacity, initial_capacity, hard_limit);
+    if (ret != SM2_IC_SUCCESS)
     {
-        sm2_revocation_merkle_multiproof_cleanup(proof);
-        return reserve_ret;
+        multiproof_reset(state);
+        return ret;
     }
 
-    proof->query_count = serial_count;
-    proof->unique_hash_count = 0;
+    state->query_count = serial_count;
+    state->unique_hash_count = 0;
 
     for (size_t i = 0; i < serial_count; i++)
     {
-        sm2_rev_merkle_membership_proof_t member;
-        sm2_ic_error_t ret = sm2_revocation_merkle_prove_member(
-            tree, serial_numbers[i], &member);
+        sm2_rev_member_proof_t member;
+        ret = sm2_rev_tree_prove_member(tree, serial_numbers[i], &member);
         if (ret != SM2_IC_SUCCESS)
         {
-            sm2_revocation_merkle_multiproof_cleanup(proof);
+            multiproof_reset(state);
             return ret;
         }
 
-        sm2_rev_merkle_multiproof_item_t *item = &proof->items[i];
+        sm2_rev_multi_item_t *item = &state->items[i];
         item->serial_number = member.serial_number;
         item->leaf_index = member.leaf_index;
         item->leaf_count = member.leaf_count;
@@ -809,11 +847,11 @@ sm2_ic_error_t sm2_revocation_merkle_build_multiproof(
         for (size_t j = 0; j < member.sibling_count; j++)
         {
             uint16_t ref = 0;
-            ret = multiproof_find_or_add_hash(proof, member.sibling_hashes[j],
+            ret = multiproof_find_or_add_hash(state, member.sibling_hashes[j],
                 &hash_capacity, hard_limit, &ref);
             if (ret != SM2_IC_SUCCESS)
             {
-                sm2_revocation_merkle_multiproof_cleanup(proof);
+                multiproof_reset(state);
                 return ret;
             }
             item->sibling_ref[j] = ref;
@@ -824,9 +862,9 @@ sm2_ic_error_t sm2_revocation_merkle_build_multiproof(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_verify_multiproof(
+sm2_ic_error_t sm2_rev_multi_proof_verify(
     const uint8_t root_hash[SM2_REV_MERKLE_HASH_LEN],
-    const sm2_rev_merkle_multiproof_t *proof)
+    const sm2_rev_multi_proof_t *proof)
 {
     if (!root_hash || !proof)
         return SM2_IC_ERR_PARAM;
@@ -838,13 +876,13 @@ sm2_ic_error_t sm2_revocation_merkle_verify_multiproof(
 
     for (size_t i = 0; i < proof->query_count; i++)
     {
-        sm2_rev_merkle_membership_proof_t member;
+        sm2_rev_member_proof_t member;
         sm2_ic_error_t ret
             = multiproof_expand_member(proof, &proof->items[i], &member);
         if (ret != SM2_IC_SUCCESS)
             return ret;
 
-        ret = sm2_revocation_merkle_verify_member(root_hash, &member);
+        ret = sm2_rev_tree_verify_member(root_hash, &member);
         if (ret != SM2_IC_SUCCESS)
             return ret;
     }
@@ -852,23 +890,21 @@ sm2_ic_error_t sm2_revocation_merkle_verify_multiproof(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_verify_multiproof_with_root(
-    const sm2_rev_merkle_root_record_t *root_record, uint64_t now_ts,
-    const sm2_rev_merkle_multiproof_t *proof, sm2_rev_sync_verify_fn verify_fn,
+sm2_ic_error_t sm2_rev_multi_proof_verify_with_root(
+    const sm2_rev_root_record_t *root_record, uint64_t now_ts,
+    const sm2_rev_multi_proof_t *proof, sm2_rev_sync_verify_fn verify_fn,
     void *verify_user_ctx)
 {
-    sm2_ic_error_t ret = sm2_revocation_merkle_verify_root_record(
-        root_record, now_ts, verify_fn, verify_user_ctx);
+    sm2_ic_error_t ret
+        = sm2_rev_root_verify(root_record, now_ts, verify_fn, verify_user_ctx);
     if (ret != SM2_IC_SUCCESS)
         return ret;
 
-    return sm2_revocation_merkle_verify_multiproof(
-        root_record->root_hash, proof);
+    return sm2_rev_multi_proof_verify(root_record->root_hash, proof);
 }
 
-sm2_ic_error_t sm2_revocation_merkle_cbor_encode_multiproof(
-    const sm2_rev_merkle_multiproof_t *proof, uint8_t *output,
-    size_t *output_len)
+sm2_ic_error_t sm2_rev_multi_proof_encode(
+    const sm2_rev_multi_proof_t *proof, uint8_t *output, size_t *output_len)
 {
     if (!proof || !output || !output_len)
         return SM2_IC_ERR_PARAM;
@@ -903,7 +939,7 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_encode_multiproof(
 
     for (size_t i = 0; i < proof->query_count; i++)
     {
-        const sm2_rev_merkle_multiproof_item_t *item = &proof->items[i];
+        const sm2_rev_multi_item_t *item = &proof->items[i];
         if (item->sibling_count > SM2_REV_MERKLE_MAX_DEPTH)
             return SM2_IC_ERR_PARAM;
 
@@ -957,19 +993,22 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_encode_multiproof(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_cbor_decode_multiproof(
-    sm2_rev_merkle_multiproof_t *proof, const uint8_t *input, size_t input_len)
+sm2_ic_error_t sm2_rev_multi_proof_decode(
+    sm2_rev_multi_proof_t **proof, const uint8_t *input, size_t input_len)
 {
     if (!proof || !input)
         return SM2_IC_ERR_PARAM;
 
-    sm2_revocation_merkle_multiproof_cleanup(proof);
+    sm2_ic_error_t ret = multiproof_ensure(proof);
+    if (ret != SM2_IC_SUCCESS)
+        return ret;
+    sm2_rev_multi_proof_t *state = *proof;
+    multiproof_reset(state);
 
     size_t off = 0;
     uint8_t major = 0;
     uint64_t arr_len = 0;
-    sm2_ic_error_t ret
-        = cbor_get_type_value(input, input_len, &off, &major, &arr_len);
+    ret = cbor_get_type_value(input, input_len, &off, &major, &arr_len);
     if (ret != SM2_IC_SUCCESS || major != 4 || arr_len != 2)
         return SM2_IC_ERR_CBOR;
 
@@ -985,22 +1024,22 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_multiproof(
     if (hash_count > SIZE_MAX / SM2_REV_MERKLE_HASH_LEN)
         return SM2_IC_ERR_CBOR;
 
-    proof->unique_hashes = calloc(hash_count, sizeof(*proof->unique_hashes));
-    if (!proof->unique_hashes)
+    state->unique_hashes = calloc(hash_count, sizeof(*state->unique_hashes));
+    if (!state->unique_hashes)
     {
-        sm2_revocation_merkle_multiproof_cleanup(proof);
+        multiproof_reset(state);
         return SM2_IC_ERR_MEMORY;
     }
-    proof->unique_hash_count = hash_count;
+    state->unique_hash_count = hash_count;
 
     for (size_t i = 0; i < hash_count; i++)
     {
         size_t hash_len = 0;
-        ret = cbor_get_bytes(input, input_len, &off, proof->unique_hashes[i],
+        ret = cbor_get_bytes(input, input_len, &off, state->unique_hashes[i],
             SM2_REV_MERKLE_HASH_LEN, &hash_len);
         if (ret != SM2_IC_SUCCESS || hash_len != SM2_REV_MERKLE_HASH_LEN)
         {
-            sm2_revocation_merkle_multiproof_cleanup(proof);
+            multiproof_reset(state);
             return SM2_IC_ERR_CBOR;
         }
     }
@@ -1010,25 +1049,25 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_multiproof(
     if (ret != SM2_IC_SUCCESS || major != 4 || item_count64 == 0
         || item_count64 > SM2_REV_MERKLE_MULTI_MAX_QUERIES)
     {
-        sm2_revocation_merkle_multiproof_cleanup(proof);
+        multiproof_reset(state);
         return SM2_IC_ERR_CBOR;
     }
 
     size_t item_count = (size_t)item_count64;
-    if (item_count > SIZE_MAX / sizeof(sm2_rev_merkle_multiproof_item_t))
+    if (item_count > SIZE_MAX / sizeof(sm2_rev_multi_item_t))
     {
-        sm2_revocation_merkle_multiproof_cleanup(proof);
+        multiproof_reset(state);
         return SM2_IC_ERR_CBOR;
     }
 
-    proof->items = (sm2_rev_merkle_multiproof_item_t *)calloc(
-        item_count, sizeof(sm2_rev_merkle_multiproof_item_t));
-    if (!proof->items)
+    state->items = (sm2_rev_multi_item_t *)calloc(
+        item_count, sizeof(sm2_rev_multi_item_t));
+    if (!state->items)
     {
-        sm2_revocation_merkle_multiproof_cleanup(proof);
+        multiproof_reset(state);
         return SM2_IC_ERR_MEMORY;
     }
-    proof->query_count = item_count;
+    state->query_count = item_count;
 
     for (size_t i = 0; i < item_count; i++)
     {
@@ -1037,7 +1076,7 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_multiproof(
             input, input_len, &off, &major, &item_arr_len);
         if (ret != SM2_IC_SUCCESS || major != 4 || item_arr_len != 6)
         {
-            sm2_revocation_merkle_multiproof_cleanup(proof);
+            multiproof_reset(state);
             return SM2_IC_ERR_CBOR;
         }
 
@@ -1045,7 +1084,7 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_multiproof(
         ret = cbor_get_type_value(input, input_len, &off, &major, &serial);
         if (ret != SM2_IC_SUCCESS || major != 0)
         {
-            sm2_revocation_merkle_multiproof_cleanup(proof);
+            multiproof_reset(state);
             return SM2_IC_ERR_CBOR;
         }
 
@@ -1053,7 +1092,7 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_multiproof(
         ret = cbor_get_type_value(input, input_len, &off, &major, &leaf_idx);
         if (ret != SM2_IC_SUCCESS || major != 0)
         {
-            sm2_revocation_merkle_multiproof_cleanup(proof);
+            multiproof_reset(state);
             return SM2_IC_ERR_CBOR;
         }
 
@@ -1061,7 +1100,7 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_multiproof(
         ret = cbor_get_type_value(input, input_len, &off, &major, &leaf_count);
         if (ret != SM2_IC_SUCCESS || major != 0)
         {
-            sm2_revocation_merkle_multiproof_cleanup(proof);
+            multiproof_reset(state);
             return SM2_IC_ERR_CBOR;
         }
 
@@ -1071,7 +1110,7 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_multiproof(
         if (ret != SM2_IC_SUCCESS || major != 0
             || sibling_count > SM2_REV_MERKLE_MAX_DEPTH)
         {
-            sm2_revocation_merkle_multiproof_cleanup(proof);
+            multiproof_reset(state);
             return SM2_IC_ERR_CBOR;
         }
 
@@ -1079,11 +1118,11 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_multiproof(
         ret = cbor_get_type_value(input, input_len, &off, &major, &ref_arr_len);
         if (ret != SM2_IC_SUCCESS || major != 4 || ref_arr_len != sibling_count)
         {
-            sm2_revocation_merkle_multiproof_cleanup(proof);
+            multiproof_reset(state);
             return SM2_IC_ERR_CBOR;
         }
 
-        sm2_rev_merkle_multiproof_item_t *item = &proof->items[i];
+        sm2_rev_multi_item_t *item = &state->items[i];
         item->serial_number = serial;
         item->leaf_index = (size_t)leaf_idx;
         item->leaf_count = (size_t)leaf_count;
@@ -1096,7 +1135,7 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_multiproof(
             if (ret != SM2_IC_SUCCESS || major != 0 || ref64 > UINT16_MAX
                 || ref64 >= hash_count)
             {
-                sm2_revocation_merkle_multiproof_cleanup(proof);
+                multiproof_reset(state);
                 return SM2_IC_ERR_CBOR;
             }
             item->sibling_ref[j] = (uint16_t)ref64;
@@ -1107,19 +1146,30 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_multiproof(
             SM2_REV_MERKLE_MAX_DEPTH, &path_len);
         if (ret != SM2_IC_SUCCESS || path_len != item->sibling_count)
         {
-            sm2_revocation_merkle_multiproof_cleanup(proof);
+            multiproof_reset(state);
             return SM2_IC_ERR_CBOR;
         }
     }
 
     if (off != input_len)
     {
-        sm2_revocation_merkle_multiproof_cleanup(proof);
+        multiproof_reset(state);
         return SM2_IC_ERR_CBOR;
     }
 
     return SM2_IC_SUCCESS;
 }
+
+size_t sm2_rev_multi_proof_query_count(const sm2_rev_multi_proof_t *proof)
+{
+    return proof ? proof->query_count : 0;
+}
+
+size_t sm2_rev_multi_proof_unique_hash_count(const sm2_rev_multi_proof_t *proof)
+{
+    return proof ? proof->unique_hash_count : 0;
+}
+
 sm2_ic_error_t cbor_get_bytes_alloc(const uint8_t *in, size_t in_len,
     size_t *offset, uint8_t **out, size_t *out_len)
 {
@@ -1151,8 +1201,8 @@ sm2_ic_error_t cbor_get_bytes_alloc(const uint8_t *in, size_t in_len,
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_cbor_encode_cached_member_proof(
-    const sm2_rev_merkle_cached_member_proof_t *proof, uint8_t *output,
+sm2_ic_error_t sm2_rev_cached_member_proof_encode(
+    const sm2_rev_cached_member_proof_t *proof, uint8_t *output,
     size_t *output_len)
 {
     if (!proof || !output || !output_len)
@@ -1177,8 +1227,8 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_encode_cached_member_proof(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_cbor_decode_cached_member_proof(
-    sm2_rev_merkle_cached_member_proof_t *proof, const uint8_t *input,
+sm2_ic_error_t sm2_rev_cached_member_proof_decode(
+    sm2_rev_cached_member_proof_t *proof, const uint8_t *input,
     size_t input_len)
 {
     if (!proof || !input)
@@ -1211,9 +1261,8 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_cached_member_proof(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_cbor_encode_epoch_directory(
-    const sm2_rev_merkle_epoch_directory_t *directory, uint8_t *output,
-    size_t *output_len)
+sm2_ic_error_t sm2_rev_epoch_dir_encode(
+    const sm2_rev_epoch_dir_t *directory, uint8_t *output, size_t *output_len)
 {
     if (!directory || !output || !output_len)
         return SM2_IC_ERR_PARAM;
@@ -1228,8 +1277,8 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_encode_epoch_directory(
 
     uint8_t root_buf[512];
     size_t root_len = sizeof(root_buf);
-    sm2_ic_error_t ret = sm2_revocation_merkle_cbor_encode_root_record(
-        &directory->root_record, root_buf, &root_len);
+    sm2_ic_error_t ret
+        = sm2_rev_root_encode(&directory->root_record, root_buf, &root_len);
     if (ret != SM2_IC_SUCCESS)
         return ret;
 
@@ -1319,25 +1368,26 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_encode_epoch_directory(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_cbor_decode_epoch_directory(
-    sm2_rev_merkle_epoch_directory_t *directory, const uint8_t *input,
-    size_t input_len)
+sm2_ic_error_t sm2_rev_epoch_dir_decode(
+    sm2_rev_epoch_dir_t **directory, const uint8_t *input, size_t input_len)
 {
     if (!directory || !input)
         return SM2_IC_ERR_PARAM;
 
-    sm2_revocation_merkle_epoch_directory_cleanup(directory);
+    sm2_ic_error_t ret = epoch_dir_decode_ensure(directory);
+    if (ret != SM2_IC_SUCCESS)
+        return ret;
+    sm2_rev_epoch_dir_t *state = *directory;
+    epoch_dir_decode_reset(state);
 
     size_t off = 0;
     uint8_t major = 0;
     uint64_t arr_len = 0;
-    sm2_ic_error_t ret
-        = cbor_get_type_value(input, input_len, &off, &major, &arr_len);
+    ret = cbor_get_type_value(input, input_len, &off, &major, &arr_len);
     if (ret != SM2_IC_SUCCESS || major != 4 || arr_len != 8)
         return SM2_IC_ERR_CBOR;
 
-    ret = cbor_get_type_value(
-        input, input_len, &off, &major, &directory->epoch_id);
+    ret = cbor_get_type_value(input, input_len, &off, &major, &state->epoch_id);
     if (ret != SM2_IC_SUCCESS || major != 0)
         return SM2_IC_ERR_CBOR;
 
@@ -1347,8 +1397,7 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_epoch_directory(
     if (ret != SM2_IC_SUCCESS)
         return ret;
 
-    ret = sm2_revocation_merkle_cbor_decode_root_record(
-        &directory->root_record, root_buf, root_len);
+    ret = sm2_rev_root_decode(&state->root_record, root_buf, root_len);
     free(root_buf);
     if (ret != SM2_IC_SUCCESS)
         return ret;
@@ -1360,7 +1409,7 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_epoch_directory(
     {
         return SM2_IC_ERR_CBOR;
     }
-    directory->tree_level_count = (size_t)tree_levels;
+    state->tree_level_count = (size_t)tree_levels;
 
     uint64_t cache_levels = 0;
     ret = cbor_get_type_value(input, input_len, &off, &major, &cache_levels);
@@ -1370,7 +1419,7 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_epoch_directory(
     {
         return SM2_IC_ERR_CBOR;
     }
-    directory->cache_level_count = (size_t)cache_levels;
+    state->cache_level_count = (size_t)cache_levels;
 
     uint64_t level_arr_len = 0;
     ret = cbor_get_type_value(input, input_len, &off, &major, &level_arr_len);
@@ -1383,7 +1432,7 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_epoch_directory(
     memset(level_blob_lens, 0, sizeof(level_blob_lens));
 
     size_t total_hashes = 0;
-    for (size_t i = 0; i < directory->cache_level_count; i++)
+    for (size_t i = 0; i < state->cache_level_count; i++)
     {
         uint64_t entry_len = 0;
         ret = cbor_get_type_value(input, input_len, &off, &major, &entry_len);
@@ -1415,35 +1464,34 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_epoch_directory(
             goto decode_fail;
         }
 
-        directory->cached_level_indices[i] = (size_t)level_idx;
-        directory->cached_level_sizes[i] = level_size;
-        directory->cached_level_offsets[i] = total_hashes;
+        state->cached_level_indices[i] = (size_t)level_idx;
+        state->cached_level_sizes[i] = level_size;
+        state->cached_level_offsets[i] = total_hashes;
         total_hashes += level_size;
 
         level_blobs[i] = blob;
         level_blob_lens[i] = blob_len;
     }
 
-    directory->cached_hash_count = total_hashes;
-    directory->cached_hashes
-        = calloc(total_hashes, sizeof(*directory->cached_hashes));
-    if (!directory->cached_hashes)
+    state->cached_hash_count = total_hashes;
+    state->cached_hashes = calloc(total_hashes, sizeof(*state->cached_hashes));
+    if (!state->cached_hashes)
     {
         ret = SM2_IC_ERR_MEMORY;
         goto decode_fail;
     }
 
-    for (size_t i = 0; i < directory->cache_level_count; i++)
+    for (size_t i = 0; i < state->cache_level_count; i++)
     {
-        size_t level_off = directory->cached_level_offsets[i];
-        memcpy(directory->cached_hashes + level_off, level_blobs[i],
+        size_t level_off = state->cached_level_offsets[i];
+        memcpy(state->cached_hashes + level_off, level_blobs[i],
             level_blob_lens[i]);
         free(level_blobs[i]);
         level_blobs[i] = NULL;
     }
 
     ret = cbor_get_type_value(
-        input, input_len, &off, &major, &directory->patch_version);
+        input, input_len, &off, &major, &state->patch_version);
     if (ret != SM2_IC_SUCCESS || major != 0)
         goto decode_fail;
 
@@ -1457,18 +1505,18 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_epoch_directory(
         goto decode_fail;
     }
 
-    directory->patch_item_count = (size_t)patch_arr_len;
-    if (directory->patch_item_count > 0)
+    state->patch_item_count = (size_t)patch_arr_len;
+    if (state->patch_item_count > 0)
     {
-        directory->patch_items = (sm2_crl_delta_item_t *)calloc(
-            directory->patch_item_count, sizeof(sm2_crl_delta_item_t));
-        if (!directory->patch_items)
+        state->patch_items = (sm2_crl_delta_item_t *)calloc(
+            state->patch_item_count, sizeof(sm2_crl_delta_item_t));
+        if (!state->patch_items)
         {
             ret = SM2_IC_ERR_MEMORY;
             goto decode_fail;
         }
 
-        for (size_t i = 0; i < directory->patch_item_count; i++)
+        for (size_t i = 0; i < state->patch_item_count; i++)
         {
             uint64_t pair_len = 0;
             ret = cbor_get_type_value(
@@ -1477,23 +1525,23 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_epoch_directory(
                 goto decode_fail;
 
             ret = cbor_get_type_value(input, input_len, &off, &major,
-                &directory->patch_items[i].serial_number);
+                &state->patch_items[i].serial_number);
             if (ret != SM2_IC_SUCCESS || major != 0)
                 goto decode_fail;
 
             ret = cbor_get_bool(
-                input, input_len, &off, &directory->patch_items[i].revoked);
+                input, input_len, &off, &state->patch_items[i].revoked);
             if (ret != SM2_IC_SUCCESS)
                 goto decode_fail;
         }
     }
 
     size_t sig_len = 0;
-    ret = cbor_get_bytes(input, input_len, &off, directory->directory_signature,
-        sizeof(directory->directory_signature), &sig_len);
+    ret = cbor_get_bytes(input, input_len, &off, state->directory_signature,
+        sizeof(state->directory_signature), &sig_len);
     if (ret != SM2_IC_SUCCESS || sig_len == 0)
         goto decode_fail;
-    directory->directory_signature_len = sig_len;
+    state->directory_signature_len = sig_len;
 
     if (off != input_len)
     {
@@ -1506,6 +1554,6 @@ sm2_ic_error_t sm2_revocation_merkle_cbor_decode_epoch_directory(
 decode_fail:
     for (size_t i = 0; i < SM2_REV_MERKLE_MAX_DEPTH; i++)
         free(level_blobs[i]);
-    sm2_revocation_merkle_epoch_directory_cleanup(directory);
+    epoch_dir_decode_reset(state);
     return ret;
 }

@@ -1,9 +1,9 @@
-﻿/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-License-Identifier: Apache-2.0 */
 
 /**
  * @file merkle_k_anon.c
  * @brief k-Anonymity query builder, cluster policy, risk estimator and
- *        patch-first query callback.
+ *        epoch-lookup query callback.
  */
 
 #include "merkle_internal.h"
@@ -53,15 +53,15 @@ typedef struct
     uint8_t used;
 } merkle_u64_hash_slot_t;
 
-void merkle_k_anon_set_default_weights(sm2_rev_merkle_k_anon_query_t *query)
+void merkle_k_anon_set_default_weights(sm2_rev_kanon_query_t *query)
 {
     query->risk_weight_k = MERKLE_K_ANON_DEFAULT_WEIGHT_K;
     query->risk_weight_span = MERKLE_K_ANON_DEFAULT_WEIGHT_SPAN;
     query->risk_weight_nearest = MERKLE_K_ANON_DEFAULT_WEIGHT_NEAREST;
 }
 
-void merkle_k_anon_apply_policy_weights(sm2_rev_merkle_k_anon_query_t *query,
-    const sm2_rev_merkle_k_anon_policy_t *policy)
+void merkle_k_anon_apply_policy_weights(
+    sm2_rev_kanon_query_t *query, const sm2_rev_kanon_policy_t *policy)
 {
     if (!query)
         return;
@@ -82,7 +82,7 @@ void merkle_k_anon_apply_policy_weights(sm2_rev_merkle_k_anon_query_t *query,
 }
 
 size_t merkle_k_anon_resolve_scan_limit(
-    size_t decoy_count, size_t k, const sm2_rev_merkle_k_anon_policy_t *policy)
+    size_t decoy_count, size_t k, const sm2_rev_kanon_policy_t *policy)
 {
     size_t limit = k * MERKLE_K_ANON_DEFAULT_SCAN_FACTOR;
     if (policy && policy->candidate_scan_limit > 0)
@@ -135,9 +135,9 @@ sm2_ic_error_t merkle_u64_hash_insert(merkle_u64_hash_slot_t *slots,
 
     return SM2_IC_ERR_MEMORY;
 }
-sm2_ic_error_t sm2_revocation_merkle_build_k_anon_query(uint64_t real_serial,
+sm2_ic_error_t sm2_rev_kanon_build_query(uint64_t real_serial,
     const uint64_t *decoy_serials, size_t decoy_count, size_t k,
-    uint64_t shuffle_seed, sm2_rev_merkle_k_anon_query_t *query)
+    uint64_t shuffle_seed, sm2_rev_kanon_query_t *query)
 {
     if (!query || k == 0 || k > SM2_REV_MERKLE_K_ANON_MAX)
         return SM2_IC_ERR_PARAM;
@@ -210,15 +210,14 @@ uint64_t merkle_u64_distance(uint64_t a, uint64_t b)
     return (a >= b) ? (a - b) : (b - a);
 }
 
-sm2_ic_error_t sm2_revocation_merkle_build_k_anon_query_with_policy(
-    uint64_t real_serial, const uint64_t *decoy_serials, size_t decoy_count,
-    size_t k, uint64_t shuffle_seed,
-    const sm2_rev_merkle_k_anon_policy_t *policy,
-    sm2_rev_merkle_k_anon_query_t *query)
+sm2_ic_error_t sm2_rev_kanon_build_query_with_policy(uint64_t real_serial,
+    const uint64_t *decoy_serials, size_t decoy_count, size_t k,
+    uint64_t shuffle_seed, const sm2_rev_kanon_policy_t *policy,
+    sm2_rev_kanon_query_t *query)
 {
     if (!policy)
     {
-        return sm2_revocation_merkle_build_k_anon_query(
+        return sm2_rev_kanon_build_query(
             real_serial, decoy_serials, decoy_count, k, shuffle_seed, query);
     }
 
@@ -432,9 +431,8 @@ sm2_ic_error_t sm2_revocation_merkle_build_k_anon_query_with_policy(
     return SM2_IC_ERR_VERIFY;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_estimate_k_anon_risk(
-    const sm2_rev_merkle_k_anon_query_t *query, uint64_t real_serial,
-    double *risk_score, uint64_t *span)
+sm2_ic_error_t sm2_rev_kanon_estimate_risk(const sm2_rev_kanon_query_t *query,
+    uint64_t real_serial, double *risk_score, uint64_t *span)
 {
     if (!query)
         return SM2_IC_ERR_PARAM;
@@ -510,9 +508,8 @@ sm2_ic_error_t sm2_revocation_merkle_estimate_k_anon_risk(
 
     return SM2_IC_SUCCESS;
 }
-sm2_ic_error_t sm2_revocation_merkle_export_k_anon_serials(
-    const sm2_rev_merkle_k_anon_query_t *query, uint64_t *serials,
-    size_t *serial_count)
+sm2_ic_error_t sm2_rev_kanon_export_serials(
+    const sm2_rev_kanon_query_t *query, uint64_t *serials, size_t *serial_count)
 {
     if (!query || !serial_count)
         return SM2_IC_ERR_PARAM;
@@ -533,17 +530,16 @@ sm2_ic_error_t sm2_revocation_merkle_export_k_anon_serials(
     return SM2_IC_SUCCESS;
 }
 
-sm2_ic_error_t sm2_revocation_merkle_query_patch_first_cb(
-    const sm2_implicit_cert_t *cert, uint64_t now_ts, void *user_ctx,
-    sm2_rev_status_t *status)
+sm2_ic_error_t sm2_rev_epoch_lookup_cb(const sm2_implicit_cert_t *cert,
+    uint64_t now_ts, void *user_ctx, sm2_rev_status_t *status)
 {
     if (!cert || !status || !user_ctx)
         return SM2_IC_ERR_PARAM;
 
-    sm2_rev_merkle_query_ctx_t *ctx = (sm2_rev_merkle_query_ctx_t *)user_ctx;
+    sm2_rev_lookup_ctx_t *ctx = (sm2_rev_lookup_ctx_t *)user_ctx;
     if (!ctx->directory || !ctx->verify_fn)
         return SM2_IC_ERR_PARAM;
 
-    return sm2_revocation_merkle_epoch_query_patch_first(ctx->directory, now_ts,
-        cert->serial_number, ctx->verify_fn, ctx->verify_user_ctx, status);
+    return sm2_rev_epoch_lookup(ctx->directory, now_ts, cert->serial_number,
+        ctx->verify_fn, ctx->verify_user_ctx, status);
 }
